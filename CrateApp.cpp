@@ -52,6 +52,9 @@ struct RenderItem
     UINT IndexCount = 0;
     UINT StartIndexLocation = 0;
     int BaseVertexLocation = 0;
+
+	int AnimType = 0;
+
 };
 
 class CrateApp : public D3DApp
@@ -179,82 +182,35 @@ bool CrateApp::Initialize()
     if(!D3DApp::Initialize())
         return false;
 
-    // Reset the command list to prep for initialization commands.
     ThrowIfFailed(mCommandList->Reset(mDirectCmdListAlloc.Get(), nullptr));
 
-    // Get the increment size of a descriptor in this heap type.  This is hardware specific, 
-	// so we have to query this information.
-    mCbvSrvDescriptorSize = md3dDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    mCbvSrvDescriptorSize = md3dDevice->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
- 
-	LoadTextures();
+    // Инициализация TextureManager
+    mTexMgr.Init(md3dDevice.Get(), mCbvSrvDescriptorSize);
+    mTexMgr.CreateSrvHeap(64);
+
+    // Загрузка OBJ сцены
+    mObjMesh = ObjLoader::Load("breakfast_room.obj");
+
+    LoadTextures();
     BuildRootSignature();
-	BuildDescriptorHeaps();
+    BuildDescriptorHeaps();
     BuildShadersAndInputLayout();
     BuildShapeGeometry();
-	BuildMaterials();
+    BuildMaterials();
     BuildRenderItems();
     BuildFrameResources();
     BuildPSOs();
 
-    // Execute the initialization commands.
     ThrowIfFailed(mCommandList->Close());
     ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
     mCommandQueue->ExecuteCommandLists(_countof(cmdsLists), cmdsLists);
-
-    // Wait until initialization is complete.
     FlushCommandQueue();
 
-	// Инициализация TextureManager
-	UINT srvSize = md3dDevice->GetDescriptorHandleIncrementSize(
-		D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-	mTexMgr.Init(md3dDevice.Get(), srvSize);
-	mTexMgr.CreateSrvHeap(64);
+    mTexMgr.ReleaseUploadHeaps();
 
-	// Загрузка OBJ модели
-	mObjMesh = ObjLoader::Load("diablo.obj");
-
-	// Загрузка текстур материалов
-	ThrowIfFailed(mCommandList->Reset(mDirectCmdListAlloc.Get(), nullptr));
-	for (auto& pair : mObjMesh.Materials)
-	{
-		auto& mat = pair.second;
-		if (!mat.DiffuseMapPath.empty())
-			mat.SrvHeapIndex = (int)mTexMgr.LoadTexture(
-				mat.DiffuseMapPath,
-				std::wstring(pair.first.begin(), pair.first.end()),
-				mCommandList.Get());
-	}
-	mCommandList->Close();
-	ID3D12CommandList* cmds[] = { mCommandList.Get() };
-	mCommandQueue->ExecuteCommandLists(1, cmds);
-	FlushCommandQueue();
-	mTexMgr.ReleaseUploadHeaps();
-
-	// UV анимация
-	UVAnimParams p;
-	p.Tiling = { 1.0f, 1.0f };
-	p.ScrollSpeed = { 0.05f, 0.0f };
-	mUVAnim.Register("diablo", p);
-
-	// Создать CB для UV анимации
-	UINT64 cbSize = (sizeof(UVAnimCB) + 255) & ~255;
-	D3D12_HEAP_PROPERTIES uploadHeap = {};
-	uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
-	D3D12_RESOURCE_DESC bufDesc = {};
-	bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-	bufDesc.Width = cbSize;
-	bufDesc.Height = 1;
-	bufDesc.DepthOrArraySize = 1;
-	bufDesc.MipLevels = 1;
-	bufDesc.Format = DXGI_FORMAT_UNKNOWN;
-	bufDesc.SampleDesc = { 1, 0 };
-	bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-	ThrowIfFailed(md3dDevice->CreateCommittedResource(
-		&uploadHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
-		D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-		IID_PPV_ARGS(&mUVAnimCBUpload)));
-	mUVAnimCBUpload->Map(0, nullptr, (void**)&mUVAnimCBMapped);
     return true;
 }
  
@@ -270,9 +226,9 @@ void CrateApp::OnResize()
 void CrateApp::Update(const GameTimer& gt)
 {
 	// Обновить UV анимацию
-	mUVAnim.Update(gt.DeltaTime());
-	UVAnimCB data = mUVAnim.GetCBData("diablo");
-	memcpy(mUVAnimCBMapped, &data, sizeof(UVAnimCB));
+	//mUVAnim.Update(gt.DeltaTime());
+	//UVAnimCB data = mUVAnim.GetCBData("diablo");
+	//memcpy(mUVAnimCBMapped, &data, sizeof(UVAnimCB));
 
 	OnKeyboardInput(gt);
 	UpdateCamera(gt);
@@ -334,30 +290,30 @@ void CrateApp::Draw(const GameTimer& gt)
     DrawRenderItems(mCommandList.Get(), mOpaqueRitems);
 
 	// ── Рисуем OBJ модель ──────────────────────────────────────────
-	if (!mObjMesh.Vertices.empty())
-	{
-		mTexMgr.BindHeap(mCommandList.Get());
+	//if (!mObjMesh.Vertices.empty())
+	//{
+	//	mTexMgr.BindHeap(mCommandList.Get());
 
-		// UV анимация CB на слот 2 (там где у Luna matCB)
-		mCommandList->SetGraphicsRootConstantBufferView(
-			2, mUVAnimCBUpload->GetGPUVirtualAddress());
+	//	// UV анимация CB на слот 2 (там где у Luna matCB)
+	//	mCommandList->SetGraphicsRootConstantBufferView(
+	//		2, mUVAnimCBUpload->GetGPUVirtualAddress());
 
-		for (size_t i = 0; i < mObjMesh.SubMeshes.size(); ++i)
-		{
-			const auto& sub = mObjMesh.SubMeshes[i];
-			if (sub.Indices.empty()) continue;
+	//	for (size_t i = 0; i < mObjMesh.SubMeshes.size(); ++i)
+	//	{
+	//		const auto& sub = mObjMesh.SubMeshes[i];
+	//		if (sub.Indices.empty()) continue;
 
-			auto matIt = mObjMesh.Materials.find(sub.MaterialName);
-			if (matIt != mObjMesh.Materials.end() && matIt->second.SrvHeapIndex >= 0)
-			{
-				auto tex = mTexMgr.GetGpuHandle((UINT)matIt->second.SrvHeapIndex);
-				mCommandList->SetGraphicsRootDescriptorTable(0, tex);
-			}
+	//		auto matIt = mObjMesh.Materials.find(sub.MaterialName);
+	//		if (matIt != mObjMesh.Materials.end() && matIt->second.SrvHeapIndex >= 0)
+	//		{
+	//			auto tex = mTexMgr.GetGpuHandle((UINT)matIt->second.SrvHeapIndex);
+	//			mCommandList->SetGraphicsRootDescriptorTable(0, tex);
+	//		}
 
-			mCommandList->DrawIndexedInstanced(
-				(UINT)sub.Indices.size(), 1, 0, 0, 0);
-		}
-	}
+	//		mCommandList->DrawIndexedInstanced(
+	//			(UINT)sub.Indices.size(), 1, 0, 0, 0);
+	//	}
+	//}
 
     // Indicate a state transition on the resource usage.
 	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(CurrentBackBuffer(),
@@ -450,6 +406,7 @@ void CrateApp::UpdateCamera(const GameTimer& gt)
 
 void CrateApp::AnimateMaterials(const GameTimer& gt)
 {
+	/*
 	// Анимация UV для Diablo — скролл текстуры
 	static float offsetU = 0.0f;
 	offsetU += 0.05f * gt.DeltaTime();
@@ -466,16 +423,19 @@ void CrateApp::AnimateMaterials(const GameTimer& gt)
 			e->NumFramesDirty = gNumFrameResources;
 		}
 	}
+	*/
 }
 
 void CrateApp::UpdateObjectCBs(const GameTimer& gt)
 {
 	auto currObjectCB = mCurrFrameResource->ObjectCB.get();
-	for(auto& e : mAllRitems)
+	for (auto& e : mAllRitems)
 	{
-		// Only update the cbuffer data if the constants have changed.  
-		// This needs to be tracked per frame resource.
-		if(e->NumFramesDirty > 0)
+		// Картина обновляется каждый кадр из-за анимации
+		if (e->AnimType == 1)
+			e->NumFramesDirty = gNumFrameResources;
+
+		if (e->NumFramesDirty > 0)
 		{
 			XMMATRIX world = XMLoadFloat4x4(&e->World);
 			XMMATRIX texTransform = XMLoadFloat4x4(&e->TexTransform);
@@ -483,10 +443,9 @@ void CrateApp::UpdateObjectCBs(const GameTimer& gt)
 			ObjectConstants objConstants;
 			XMStoreFloat4x4(&objConstants.World, XMMatrixTranspose(world));
 			XMStoreFloat4x4(&objConstants.TexTransform, XMMatrixTranspose(texTransform));
+			objConstants.AnimType = e->AnimType;
 
 			currObjectCB->CopyData(e->ObjCBIndex, objConstants);
-
-			// Next FrameResource need to be updated too.
 			e->NumFramesDirty--;
 		}
 	}
@@ -541,14 +500,16 @@ void CrateApp::UpdateMainPassCB(const GameTimer& gt)
 	mMainPassCB.FarZ = 1000.0f;
 	mMainPassCB.TotalTime = gt.TotalTime();
 	mMainPassCB.DeltaTime = gt.DeltaTime();
-	mMainPassCB.AmbientLight = { 0.25f, 0.25f, 0.35f, 1.0f };
-	mMainPassCB.Lights[0].Direction = { 0.57735f, -0.57735f, 0.57735f };
-	mMainPassCB.Lights[0].Strength = { 1.0f, 1.0f, 1.0f };
-	mMainPassCB.Lights[1].Direction = { -0.57735f, -0.57735f, 0.57735f };
-	mMainPassCB.Lights[1].Strength = { 0.3f, 0.3f, 0.6f };
-	mMainPassCB.Lights[2].Direction = { 0.0f, 0.707f, -0.707f };
-	mMainPassCB.Lights[2].Strength = { 0.2f, 0.15f, 0.1f };
+	mMainPassCB.AmbientLight = { 0.6f, 0.6f, 0.6f, 1.0f }; // было 0.25
 
+	mMainPassCB.Lights[0].Direction = { 0.0f, -1.0f, 0.0f };
+	mMainPassCB.Lights[0].Strength = { 1.0f, 1.0f, 1.0f };
+
+	mMainPassCB.Lights[1].Direction = { 0.57735f, -0.57735f, 0.57735f };
+	mMainPassCB.Lights[1].Strength = { 0.5f, 0.5f, 0.5f };
+
+	mMainPassCB.Lights[2].Direction = { -0.57735f, -0.57735f, 0.57735f };
+	mMainPassCB.Lights[2].Strength = { 0.3f, 0.3f, 0.3f };
 	auto currPassCB = mCurrFrameResource->PassCB.get();
 	currPassCB->CopyData(0, mMainPassCB);
 }
@@ -607,22 +568,26 @@ void CrateApp::BuildRootSignature()
 
 void CrateApp::BuildDescriptorHeaps()
 {
-	//
-	// Create the SRV heap.
-	//
+	// Считаем текстуры: 0=woodCrate, 1=white, 2+=MTL текстуры
+	UINT mtlTexCount = 0;
+	for (auto& pair : mObjMesh.Materials)
+		if (!pair.second.DiffuseMapPath.empty())
+			mtlTexCount++;
+
+	UINT totalTex = 2 + mtlTexCount;
+
 	D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
-	srvHeapDesc.NumDescriptors = 1;
+	srvHeapDesc.NumDescriptors = totalTex;
 	srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
 	srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-	ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&mSrvDescriptorHeap)));
+	ThrowIfFailed(md3dDevice->CreateDescriptorHeap(
+		&srvHeapDesc, IID_PPV_ARGS(&mSrvDescriptorHeap)));
 
-	//
-	// Fill out the heap with actual descriptors.
-	//
-	CD3DX12_CPU_DESCRIPTOR_HANDLE hDescriptor(mSrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+	CD3DX12_CPU_DESCRIPTOR_HANDLE hDesc(
+		mSrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
 
+	// Слот 0 — woodCrate
 	auto woodCrateTex = mTextures["woodCrateTex"]->Resource;
- 
 	D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
 	srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 	srvDesc.Format = woodCrateTex->GetDesc().Format;
@@ -630,8 +595,169 @@ void CrateApp::BuildDescriptorHeaps()
 	srvDesc.Texture2D.MostDetailedMip = 0;
 	srvDesc.Texture2D.MipLevels = woodCrateTex->GetDesc().MipLevels;
 	srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+	md3dDevice->CreateShaderResourceView(woodCrateTex.Get(), &srvDesc, hDesc);
 
-	md3dDevice->CreateShaderResourceView(woodCrateTex.Get(), &srvDesc, hDescriptor);
+	// Слот 1 — белая текстура 1x1 для материалов без текстуры
+	hDesc.Offset(1, mCbvSrvDescriptorSize);
+	{
+		// Создаём белую текстуру 1x1 программно
+		D3D12_RESOURCE_DESC whiteDesc = {};
+		whiteDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		whiteDesc.Width = 1;
+		whiteDesc.Height = 1;
+		whiteDesc.DepthOrArraySize = 1;
+		whiteDesc.MipLevels = 1;
+		whiteDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		whiteDesc.SampleDesc = { 1, 0 };
+		whiteDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+		D3D12_HEAP_PROPERTIES defaultHeap = {};
+		defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+		ComPtr<ID3D12Resource> whiteResource;
+		md3dDevice->CreateCommittedResource(
+			&defaultHeap, D3D12_HEAP_FLAG_NONE, &whiteDesc,
+			D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+			IID_PPV_ARGS(&whiteResource));
+
+		// Upload буфер
+		UINT64 uploadSize = GetRequiredIntermediateSize(whiteResource.Get(), 0, 1);
+		D3D12_HEAP_PROPERTIES uploadHeap = {};
+		uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+		D3D12_RESOURCE_DESC bufDesc = {};
+		bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		bufDesc.Width = uploadSize;
+		bufDesc.Height = 1;
+		bufDesc.DepthOrArraySize = 1;
+		bufDesc.MipLevels = 1;
+		bufDesc.Format = DXGI_FORMAT_UNKNOWN;
+		bufDesc.SampleDesc = { 1, 0 };
+		bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+		ComPtr<ID3D12Resource> whiteUpload;
+		md3dDevice->CreateCommittedResource(
+			&uploadHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
+			D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+			IID_PPV_ARGS(&whiteUpload));
+
+		// Белый пиксель RGBA = 0xFFFFFFFF
+		UINT32 whitePixel = 0xFFFFFFFF;
+		D3D12_SUBRESOURCE_DATA whiteData = {};
+		whiteData.pData = &whitePixel;
+		whiteData.RowPitch = 4;
+		whiteData.SlicePitch = 4;
+		UpdateSubresources(mCommandList.Get(),
+			whiteResource.Get(), whiteUpload.Get(),
+			0, 0, 1, &whiteData);
+
+		D3D12_RESOURCE_BARRIER whiteBarrier = {};
+		whiteBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		whiteBarrier.Transition.pResource = whiteResource.Get();
+		whiteBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+		whiteBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		whiteBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		mCommandList->ResourceBarrier(1, &whiteBarrier);
+
+		// Сохраняем чтобы не удалился
+		mTextures["whiteTex"] = std::make_unique<Texture>();
+		mTextures["whiteTex"]->Resource = whiteResource;
+		mTextures["whiteTex"]->UploadHeap = whiteUpload;
+
+		// SRV в слот 1
+		D3D12_SHADER_RESOURCE_VIEW_DESC whiteSrvDesc = {};
+		whiteSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		whiteSrvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		whiteSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		whiteSrvDesc.Texture2D.MostDetailedMip = 0;
+		whiteSrvDesc.Texture2D.MipLevels = 1;
+		whiteSrvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+		md3dDevice->CreateShaderResourceView(whiteResource.Get(), &whiteSrvDesc, hDesc);
+	}
+
+	// Слоты 2+ — текстуры из MTL
+	UINT slot = 2;
+	for (auto& pair : mObjMesh.Materials)
+	{
+		auto& mat = pair.second;
+		if (mat.DiffuseMapPath.empty()) continue;
+
+		DirectX::TexMetadata  metadata;
+		DirectX::ScratchImage image;
+		HRESULT hr = DirectX::LoadFromWICFile(
+			mat.DiffuseMapPath.c_str(),
+			DirectX::WIC_FLAGS_NONE, &metadata, image);
+		if (FAILED(hr)) { mat.SrvHeapIndex = 1; continue; }
+
+		ComPtr<ID3D12Resource> texResource;
+		ComPtr<ID3D12Resource> uploadResource;
+
+		D3D12_RESOURCE_DESC resDesc = {};
+		resDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		resDesc.Width = (UINT64)metadata.width;
+		resDesc.Height = (UINT)metadata.height;
+		resDesc.DepthOrArraySize = 1;
+		resDesc.MipLevels = 1;
+		resDesc.Format = metadata.format;
+		resDesc.SampleDesc = { 1, 0 };
+		resDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+		D3D12_HEAP_PROPERTIES defaultHeap = {};
+		defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+		md3dDevice->CreateCommittedResource(
+			&defaultHeap, D3D12_HEAP_FLAG_NONE, &resDesc,
+			D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+			IID_PPV_ARGS(&texResource));
+
+		UINT64 uploadSize = GetRequiredIntermediateSize(texResource.Get(), 0, 1);
+		D3D12_HEAP_PROPERTIES uploadHeap = {};
+		uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+		D3D12_RESOURCE_DESC bufDesc = {};
+		bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		bufDesc.Width = uploadSize;
+		bufDesc.Height = 1;
+		bufDesc.DepthOrArraySize = 1;
+		bufDesc.MipLevels = 1;
+		bufDesc.Format = DXGI_FORMAT_UNKNOWN;
+		bufDesc.SampleDesc = { 1, 0 };
+		bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		md3dDevice->CreateCommittedResource(
+			&uploadHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
+			D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+			IID_PPV_ARGS(&uploadResource));
+
+		const DirectX::Image* img = image.GetImage(0, 0, 0);
+		D3D12_SUBRESOURCE_DATA subData = {};
+		subData.pData = img->pixels;
+		subData.RowPitch = (LONG_PTR)img->rowPitch;
+		subData.SlicePitch = (LONG_PTR)img->slicePitch;
+		UpdateSubresources(mCommandList.Get(),
+			texResource.Get(), uploadResource.Get(),
+			0, 0, 1, &subData);
+
+		D3D12_RESOURCE_BARRIER barrier = {};
+		barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		barrier.Transition.pResource = texResource.Get();
+		barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+		barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		mCommandList->ResourceBarrier(1, &barrier);
+
+		mTextures[mat.Name] = std::make_unique<Texture>();
+		mTextures[mat.Name]->Resource = texResource;
+		mTextures[mat.Name]->UploadHeap = uploadResource;
+
+		hDesc.Offset(1, mCbvSrvDescriptorSize);
+		D3D12_SHADER_RESOURCE_VIEW_DESC matSrvDesc = {};
+		matSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		matSrvDesc.Format = metadata.format;
+		matSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		matSrvDesc.Texture2D.MostDetailedMip = 0;
+		matSrvDesc.Texture2D.MipLevels = 1;
+		matSrvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+		md3dDevice->CreateShaderResourceView(texResource.Get(), &matSrvDesc, hDesc);
+
+		mat.SrvHeapIndex = (int)slot++;
+	}
 }
 
 void CrateApp::BuildShadersAndInputLayout()
@@ -695,9 +821,7 @@ void CrateApp::BuildShapeGeometry()
 	geo->DrawArgs["box"] = boxSubmesh;
 
 	mGeometries[geo->Name] = std::move(geo);
-	// ── Загрузка OBJ модели ────────────────────────────────────────
-	mObjMesh = ObjLoader::Load("diablo.obj");
-
+	// ── Загрузка breakfast_room ────────────────────────────────────
 	if (!mObjMesh.Vertices.empty())
 	{
 		// Конвертируем ObjVertex -> Vertex (формат Luna)
@@ -736,7 +860,7 @@ void CrateApp::BuildShapeGeometry()
 		objGeo->IndexFormat = DXGI_FORMAT_R32_UINT;
 		objGeo->IndexBufferByteSize = objIbSize;
 
-		// Одна запись на весь меш
+		// Одна запись — весь меш целиком
 		SubmeshGeometry objSubmesh;
 		objSubmesh.IndexCount = (UINT)objIndices.size();
 		objSubmesh.StartIndexLocation = 0;
@@ -800,46 +924,78 @@ void CrateApp::BuildMaterials()
 	woodCrate->Roughness = 0.2f;
 
 	mMaterials["woodCrate"] = std::move(woodCrate);
+
+	for (auto& pair : mObjMesh.Materials)
+	{
+		const auto& objMat = pair.second;
+		auto mat = std::make_unique<Material>();
+		mat->Name = objMat.Name;
+		mat->MatCBIndex = (int)mMaterials.size();
+		mat->FresnelR0 = objMat.FresnelR0;
+		mat->Roughness = objMat.Roughness;
+
+		if (objMat.SrvHeapIndex >= 0)
+		{
+			// Есть текстура — используем её, альбедо белый
+			mat->DiffuseSrvHeapIndex = objMat.SrvHeapIndex;
+			mat->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+		}
+		else
+		{
+			// Нет текстуры — используем слот 0 (woodCrate),
+			// но перебиваем альбедо цветом из MTL
+			mat->DiffuseSrvHeapIndex = 1;
+			// Берём Kd цвет из MTL и делаем его ярче
+			mat->DiffuseAlbedo = XMFLOAT4(
+				objMat.DiffuseAlbedo.x,
+				objMat.DiffuseAlbedo.y,
+				objMat.DiffuseAlbedo.z,
+				1.0f);
+		}
+
+		mMaterials[objMat.Name] = std::move(mat);
+	}
 }
 
 void CrateApp::BuildRenderItems()
 {
-	auto boxRitem = std::make_unique<RenderItem>();
-	boxRitem->ObjCBIndex = 0;
-	XMStoreFloat4x4(&boxRitem->World,
-		XMMatrixTranslation(2.0f, 0.0f, 0.0f)
-	);
-	boxRitem->NumFramesDirty = gNumFrameResources;
-	boxRitem->Mat = mMaterials["woodCrate"].get();
-	boxRitem->Geo = mGeometries["boxGeo"].get();
-	boxRitem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-	boxRitem->IndexCount = boxRitem->Geo->DrawArgs["box"].IndexCount;
-	boxRitem->StartIndexLocation = boxRitem->Geo->DrawArgs["box"].StartIndexLocation;
-	boxRitem->BaseVertexLocation = boxRitem->Geo->DrawArgs["box"].BaseVertexLocation;
-	mAllRitems.push_back(std::move(boxRitem));
-	// ── OBJ модель ────────────────────────────────────────────────
+	// Загружаем breakfast_room
+	mObjMesh = ObjLoader::Load("breakfast_room.obj");
+
 	if (mGeometries.count("objGeo") > 0)
 	{
-		auto objRitem = std::make_unique<RenderItem>();
-		objRitem->ObjCBIndex = 1;
-		// Сдвинуть вправо и повернуть на 180 градусов
-		XMStoreFloat4x4(&objRitem->World,
-			XMMatrixRotationY(XM_PI) *
-			XMMatrixScaling(0.5f, 0.5f, 0.5f) *
-			XMMatrixTranslation(-0.5f, 0.0f, 0.0f)
-		);
-		objRitem->NumFramesDirty = gNumFrameResources;
-		objRitem->Mat = mMaterials["woodCrate"].get();
-		objRitem->Geo = mGeometries["objGeo"].get();
-		objRitem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-		objRitem->IndexCount = objRitem->Geo->DrawArgs["obj"].IndexCount;
-		objRitem->StartIndexLocation = objRitem->Geo->DrawArgs["obj"].StartIndexLocation;
-		objRitem->BaseVertexLocation = objRitem->Geo->DrawArgs["obj"].BaseVertexLocation;
-		mAllRitems.push_back(std::move(objRitem));
+		UINT submeshStart = 0;
+		for (size_t i = 0; i < mObjMesh.SubMeshes.size(); ++i)
+		{
+			const auto& sub = mObjMesh.SubMeshes[i];
+			if (sub.Indices.empty()) continue;
+
+			auto ritem = std::make_unique<RenderItem>();
+			// Если это картина — включаем анимацию качания
+			if (sub.MaterialName == "breakfast_room:Artwork")
+				ritem->AnimType = 1;
+			ritem->ObjCBIndex = (UINT)i;
+			// Берём материал из MTL или woodCrate если не найден
+			auto matIt = mMaterials.find(sub.MaterialName);
+			if (matIt != mMaterials.end())
+				ritem->Mat = matIt->second.get();
+			else
+				ritem->Mat = mMaterials["woodCrate"].get();
+			ritem->Geo = mGeometries["objGeo"].get();
+			ritem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+			ritem->IndexCount = (UINT)sub.Indices.size();
+			ritem->StartIndexLocation = submeshStart;
+			ritem->BaseVertexLocation = 0;
+
+			XMStoreFloat4x4(&ritem->World, XMMatrixIdentity());
+			ritem->NumFramesDirty = gNumFrameResources;
+
+			mAllRitems.push_back(std::move(ritem));
+			submeshStart += (UINT)sub.Indices.size();
+		}
 	}
 
-	// All the render items are opaque.
-	for(auto& e : mAllRitems)
+	for (auto& e : mAllRitems)
 		mOpaqueRitems.push_back(e.get());
 }
 
@@ -860,8 +1016,12 @@ void CrateApp::DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::ve
         cmdList->IASetIndexBuffer(&ri->Geo->IndexBufferView());
         cmdList->IASetPrimitiveTopology(ri->PrimitiveType);
 
+		// Если нет текстуры — используем слот 0 (woodCrate)
+		int srvIndex = ri->Mat->DiffuseSrvHeapIndex;
+		if (srvIndex < 0) srvIndex = 0;
+
 		CD3DX12_GPU_DESCRIPTOR_HANDLE tex(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
-		tex.Offset(ri->Mat->DiffuseSrvHeapIndex, mCbvSrvDescriptorSize);
+		tex.Offset(srvIndex, mCbvSrvDescriptorSize);
 
         D3D12_GPU_VIRTUAL_ADDRESS objCBAddress = objectCB->GetGPUVirtualAddress() + ri->ObjCBIndex*objCBByteSize;
 		D3D12_GPU_VIRTUAL_ADDRESS matCBAddress = matCB->GetGPUVirtualAddress() + ri->Mat->MatCBIndex*matCBByteSize;
