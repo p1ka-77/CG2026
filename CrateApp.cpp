@@ -10,6 +10,7 @@
 #include "TextureManager.h"
 #include "ObjLoader.h"
 #include "TextureAnimation.h"
+#include "RenderingSystem.h"
 
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
@@ -93,6 +94,7 @@ private:
     void BuildMaterials();
     void BuildRenderItems();
     void DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::vector<RenderItem*>& ritems);
+	void RebuildDemoLights();
 
 	std::array<const CD3DX12_STATIC_SAMPLER_DESC, 6> GetStaticSamplers();
 
@@ -131,6 +133,8 @@ private:
 	TextureAnimator mUVAnim;
 	ObjMesh         mObjMesh;
 
+	RenderingSystem mRenderSys;
+
 	ComPtr<ID3D12Resource> mUVAnimCBUpload;
 	UVAnimCB* mUVAnimCBMapped = nullptr;
 	XMFLOAT4X4 mView = MathHelper::Identity4x4();
@@ -141,6 +145,28 @@ private:
 	float mRadius = 2.5f;
 
     POINT mLastMousePos;
+
+	int mSelectedDemoLight = 1;
+
+	// Directional light
+	XMFLOAT3 mDirLightDir = { 0.577f, -0.577f, 0.577f };
+	XMFLOAT3 mDirLightStrength = { 0.35f, 0.35f, 0.35f };
+
+	// Point light 1
+	XMFLOAT3 mPoint1Pos = { -3.0f, 2.2f, 1.5f };
+	float    mPoint1Range = 10.0f;
+	XMFLOAT3 mPoint1Strength = { 2.0f, 0.4f, 0.2f };
+
+	// Point light 2
+	XMFLOAT3 mPoint2Pos = { 3.0f, 2.2f, -1.5f };
+	float    mPoint2Range = 10.0f;
+	XMFLOAT3 mPoint2Strength = { 0.2f, 0.5f, 2.0f };
+
+	// Spot light
+	XMFLOAT3 mSpotPos = { 0.0f, 4.0f, -4.0f };
+	XMFLOAT3 mSpotTarget = { 0.0f, 1.0f, 0.0f };
+	float    mSpotRange = 16.0f;
+	XMFLOAT3 mSpotStrength = { 2.0f, 1.7f, 0.8f };
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance,
@@ -179,48 +205,100 @@ CrateApp::~CrateApp()
 
 bool CrateApp::Initialize()
 {
-    if(!D3DApp::Initialize())
-        return false;
+	if (!D3DApp::Initialize())
+		return false;
 
-    ThrowIfFailed(mCommandList->Reset(mDirectCmdListAlloc.Get(), nullptr));
+	ThrowIfFailed(mCommandList->Reset(mDirectCmdListAlloc.Get(), nullptr));
 
-    mCbvSrvDescriptorSize = md3dDevice->GetDescriptorHandleIncrementSize(
-        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+	mCbvSrvDescriptorSize = md3dDevice->GetDescriptorHandleIncrementSize(
+		D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-    // Инициализация TextureManager
-    mTexMgr.Init(md3dDevice.Get(), mCbvSrvDescriptorSize);
-    mTexMgr.CreateSrvHeap(64);
+	// Инициализация TextureManager
+	mTexMgr.Init(md3dDevice.Get(), mCbvSrvDescriptorSize);
+	mTexMgr.CreateSrvHeap(64);
 
-    // Загрузка OBJ сцены
-    mObjMesh = ObjLoader::Load("breakfast_room.obj");
+	// Загрузка OBJ сцены
+	mObjMesh = ObjLoader::Load("breakfast_room.obj");
 
-    LoadTextures();
-    BuildRootSignature();
-    BuildDescriptorHeaps();
-    BuildShadersAndInputLayout();
-    BuildShapeGeometry();
-    BuildMaterials();
-    BuildRenderItems();
-    BuildFrameResources();
-    BuildPSOs();
+	//
+	// Старый forward root signature пока оставляем.
+	// Он может быть полезен, если захочешь быстро откатиться или сравнить.
+	//
+	LoadTextures();
+	BuildRootSignature();
 
-    ThrowIfFailed(mCommandList->Close());
-    ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
-    mCommandQueue->ExecuteCommandLists(_countof(cmdsLists), cmdsLists);
-    FlushCommandQueue();
+	//
+	// Deferred Rendering System
+	//
+	mRenderSys.Init(
+		md3dDevice.Get(),
+		mClientWidth,
+		mClientHeight,
+		mBackBufferFormat,
+		mDepthStencilFormat
+	);
 
-    mTexMgr.ReleaseUploadHeaps();
+	mRenderSys.BuildGeometryRootSignature(md3dDevice.Get());
+	mRenderSys.BuildLightingRootSignature(md3dDevice.Get());
 
-    return true;
+	//
+	// Источники света теперь создаются через demo-поля:
+	// mPoint1Pos, mPoint1Strength, mSpotPos и т.д.
+	//
+	RebuildDemoLights();
+
+	//
+	// Обычная сборка ресурсов сцены
+	//
+	BuildDescriptorHeaps();
+	BuildShadersAndInputLayout();
+	BuildShapeGeometry();
+	BuildMaterials();
+	BuildRenderItems();
+	BuildFrameResources();
+	BuildPSOs();
+
+	//
+	// Fullscreen quad для Lighting Pass.
+	// Важно: command list ещё открыт, поэтому CopyResource внутри BuildFullscreenQuad сработает.
+	//
+	mRenderSys.BuildFullscreenQuad(
+		md3dDevice.Get(),
+		mCommandList.Get()
+	);
+
+	ThrowIfFailed(mCommandList->Close());
+
+	ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
+	mCommandQueue->ExecuteCommandLists(_countof(cmdsLists), cmdsLists);
+
+	FlushCommandQueue();
+
+	mTexMgr.ReleaseUploadHeaps();
+
+	return true;
 }
  
 void CrateApp::OnResize()
 {
-    D3DApp::OnResize();
+	D3DApp::OnResize();
 
-    // The window resized, so update the aspect ratio and recompute the projection matrix.
-    XMMATRIX P = XMMatrixPerspectiveFovLH(0.25f*MathHelper::Pi, AspectRatio(), 1.0f, 1000.0f);
-    XMStoreFloat4x4(&mProj, P);
+	XMMATRIX P = XMMatrixPerspectiveFovLH(
+		0.25f * MathHelper::Pi,
+		AspectRatio(),
+		1.0f,
+		1000.0f);
+
+	XMStoreFloat4x4(&mProj, P);
+
+	if (md3dDevice != nullptr)
+	{
+		mRenderSys.OnResize(
+			md3dDevice.Get(),
+			mClientWidth,
+			mClientHeight
+		);
+	}
 }
 
 void CrateApp::Update(const GameTimer& gt)
@@ -255,88 +333,118 @@ void CrateApp::Update(const GameTimer& gt)
 
 void CrateApp::Draw(const GameTimer& gt)
 {
-    auto cmdListAlloc = mCurrFrameResource->CmdListAlloc;
+	auto cmdListAlloc = mCurrFrameResource->CmdListAlloc;
 
-    // Reuse the memory associated with command recording.
-    // We can only reset when the associated command lists have finished execution on the GPU.
-    ThrowIfFailed(cmdListAlloc->Reset());
+	// Сброс allocator'а текущего frame resource.
+	ThrowIfFailed(cmdListAlloc->Reset());
 
-    // A command list can be reset after it has been added to the command queue via ExecuteCommandList.
-    // Reusing the command list reuses memory.
-    ThrowIfFailed(mCommandList->Reset(cmdListAlloc.Get(), mOpaquePSO.Get()));
+	// PSO можно передать nullptr, потому что нужные PSO выставит RenderingSystem.
+	ThrowIfFailed(mCommandList->Reset(cmdListAlloc.Get(), nullptr));
 
-    mCommandList->RSSetViewports(1, &mScreenViewport);
-    mCommandList->RSSetScissorRects(1, &mScissorRect);
+	//
+	// ─────────────────────────────────────────────
+	// 1. GEOMETRY PASS
+	// Рисуем всю сцену не в back buffer, а в GBuffer.
+	// ─────────────────────────────────────────────
+	//
 
-    // Indicate a state transition on the resource usage.
-	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(CurrentBackBuffer(),
-		D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
+	mRenderSys.BeginGeometryPass(
+		mCommandList.Get(),
+		DepthStencilView(),
+		mScreenViewport,
+		mScissorRect
+	);
 
-    // Clear the back buffer and depth buffer.
-    mCommandList->ClearRenderTargetView(CurrentBackBufferView(), Colors::LightSteelBlue, 0, nullptr);
-    mCommandList->ClearDepthStencilView(DepthStencilView(), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+	// Depth buffer нужно очистить перед geometry pass.
+	mCommandList->ClearDepthStencilView(
+		DepthStencilView(),
+		D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+		1.0f,
+		0,
+		0,
+		nullptr
+	);
 
-    // Specify the buffers we are going to render to.
-    mCommandList->OMSetRenderTargets(1, &CurrentBackBufferView(), true, &DepthStencilView());
-
+	// Для GeometryPass.hlsl нужна куча с обычными текстурами сцены.
 	ID3D12DescriptorHeap* descriptorHeaps[] = { mSrvDescriptorHeap.Get() };
 	mCommandList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
 
-	mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
-
+	// Geometry root signature использует:
+	// slot 0 — texture SRV
+	// slot 1 — object CBV
+	// slot 2 — pass CBV
+	// slot 3 — material CBV
 	auto passCB = mCurrFrameResource->PassCB->Resource();
-	mCommandList->SetGraphicsRootConstantBufferView(2, passCB->GetGPUVirtualAddress());
+	mCommandList->SetGraphicsRootConstantBufferView(
+		2,
+		passCB->GetGPUVirtualAddress()
+	);
 
-    DrawRenderItems(mCommandList.Get(), mOpaqueRitems);
+	// DrawRenderItems уже выставляет:
+	// slot 0 — texture
+	// slot 1 — object CB
+	// slot 3 — material CB
+	DrawRenderItems(mCommandList.Get(), mOpaqueRitems);
 
-	// ── Рисуем OBJ модель ──────────────────────────────────────────
-	//if (!mObjMesh.Vertices.empty())
-	//{
-	//	mTexMgr.BindHeap(mCommandList.Get());
+	// Переводим GBuffer из RENDER_TARGET в PIXEL_SHADER_RESOURCE.
+	mRenderSys.EndGeometryPass(mCommandList.Get());
 
-	//	// UV анимация CB на слот 2 (там где у Luna matCB)
-	//	mCommandList->SetGraphicsRootConstantBufferView(
-	//		2, mUVAnimCBUpload->GetGPUVirtualAddress());
+	//
+	// ─────────────────────────────────────────────
+	// 2. LIGHTING PASS
+	// Рисуем fullscreen quad в back buffer.
+	// LightingPass.hlsl читает GBuffer и считает свет.
+	// ─────────────────────────────────────────────
+	//
 
-	//	for (size_t i = 0; i < mObjMesh.SubMeshes.size(); ++i)
-	//	{
-	//		const auto& sub = mObjMesh.SubMeshes[i];
-	//		if (sub.Indices.empty()) continue;
+	auto barrierToRenderTarget = CD3DX12_RESOURCE_BARRIER::Transition(
+		CurrentBackBuffer(),
+		D3D12_RESOURCE_STATE_PRESENT,
+		D3D12_RESOURCE_STATE_RENDER_TARGET
+	);
 
-	//		auto matIt = mObjMesh.Materials.find(sub.MaterialName);
-	//		if (matIt != mObjMesh.Materials.end() && matIt->second.SrvHeapIndex >= 0)
-	//		{
-	//			auto tex = mTexMgr.GetGpuHandle((UINT)matIt->second.SrvHeapIndex);
-	//			mCommandList->SetGraphicsRootDescriptorTable(0, tex);
-	//		}
+	mCommandList->ResourceBarrier(1, &barrierToRenderTarget);
 
-	//		mCommandList->DrawIndexedInstanced(
-	//			(UINT)sub.Indices.size(), 1, 0, 0, 0);
-	//	}
-	//}
+	mCommandList->ClearRenderTargetView(
+		CurrentBackBufferView(),
+		Colors::Black,
+		0,
+		nullptr
+	);
 
-    // Indicate a state transition on the resource usage.
-	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(CurrentBackBuffer(),
-		D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT));
+	mRenderSys.LightingPass(
+		mCommandList.Get(),
+		CurrentBackBufferView(),
+		mScreenViewport,
+		mScissorRect,
+		mEyePos,
+		XMFLOAT4(0.15f, 0.15f, 0.15f, 1.0f)
+	);
 
-    // Done recording commands.
-    ThrowIfFailed(mCommandList->Close());
+	auto barrierToPresent = CD3DX12_RESOURCE_BARRIER::Transition(
+		CurrentBackBuffer(),
+		D3D12_RESOURCE_STATE_RENDER_TARGET,
+		D3D12_RESOURCE_STATE_PRESENT
+	);
 
-    // Add the command list to the queue for execution.
-    ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
-    mCommandQueue->ExecuteCommandLists(_countof(cmdsLists), cmdsLists);
+	mCommandList->ResourceBarrier(1, &barrierToPresent);
 
-    // Swap the back and front buffers
-    ThrowIfFailed(mSwapChain->Present(0, 0));
+	//
+	// ─────────────────────────────────────────────
+	// 3. EXECUTE + PRESENT
+	// ─────────────────────────────────────────────
+	//
+
+	ThrowIfFailed(mCommandList->Close());
+
+	ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
+	mCommandQueue->ExecuteCommandLists(_countof(cmdsLists), cmdsLists);
+
+	ThrowIfFailed(mSwapChain->Present(0, 0));
 	mCurrBackBuffer = (mCurrBackBuffer + 1) % SwapChainBufferCount;
 
-    // Advance the fence value to mark commands up to this fence point.
-    mCurrFrameResource->Fence = ++mCurrentFence;
-
-    // Add an instruction to the command queue to set a new fence point. 
-    // Because we are on the GPU timeline, the new fence point won't be 
-    // set until the GPU finishes processing all the commands prior to this Signal().
-    mCommandQueue->Signal(mFence.Get(), mCurrentFence);
+	mCurrFrameResource->Fence = ++mCurrentFence;
+	mCommandQueue->Signal(mFence.Get(), mCurrentFence);
 }
 
 void CrateApp::OnMouseDown(WPARAM btnState, int x, int y)
@@ -386,8 +494,140 @@ void CrateApp::OnMouseMove(WPARAM btnState, int x, int y)
  
 void CrateApp::OnKeyboardInput(const GameTimer& gt)
 {
+	const float moveSpeed = 4.0f * gt.DeltaTime();
+	const float rangeSpeed = 10.0f * gt.DeltaTime();
+
+	// Выбор источника света.
+	if (GetAsyncKeyState('1') & 0x8000)
+		mSelectedDemoLight = 1;
+
+	if (GetAsyncKeyState('2') & 0x8000)
+		mSelectedDemoLight = 2;
+
+	if (GetAsyncKeyState('3') & 0x8000)
+		mSelectedDemoLight = 3;
+
+	XMFLOAT3* selectedPos = nullptr;
+	XMFLOAT3* selectedStrength = nullptr;
+	float* selectedRange = nullptr;
+
+	if (mSelectedDemoLight == 1)
+	{
+		selectedPos = &mPoint1Pos;
+		selectedStrength = &mPoint1Strength;
+		selectedRange = &mPoint1Range;
+	}
+	else if (mSelectedDemoLight == 2)
+	{
+		selectedPos = &mPoint2Pos;
+		selectedStrength = &mPoint2Strength;
+		selectedRange = &mPoint2Range;
+	}
+	else if (mSelectedDemoLight == 3)
+	{
+		selectedPos = &mSpotPos;
+		selectedStrength = &mSpotStrength;
+		selectedRange = &mSpotRange;
+	}
+
+	if (selectedPos != nullptr)
+	{
+		// Движение по сцене.
+		if (GetAsyncKeyState('A') & 0x8000)
+			selectedPos->x -= moveSpeed;
+
+		if (GetAsyncKeyState('D') & 0x8000)
+			selectedPos->x += moveSpeed;
+
+		if (GetAsyncKeyState('W') & 0x8000)
+			selectedPos->z += moveSpeed;
+
+		if (GetAsyncKeyState('S') & 0x8000)
+			selectedPos->z -= moveSpeed;
+
+		if (GetAsyncKeyState('Q') & 0x8000)
+			selectedPos->y -= moveSpeed;
+
+		if (GetAsyncKeyState('E') & 0x8000)
+			selectedPos->y += moveSpeed;
+	}
+
+	if (selectedStrength != nullptr)
+	{
+		// Быстрая смена цвета.
+		if (GetAsyncKeyState('Z') & 0x8000)
+			*selectedStrength = XMFLOAT3(2.0f, 0.4f, 0.2f); // красно-оранжевый
+
+		if (GetAsyncKeyState('X') & 0x8000)
+			*selectedStrength = XMFLOAT3(0.2f, 0.5f, 2.0f); // синий
+
+		if (GetAsyncKeyState('C') & 0x8000)
+			*selectedStrength = XMFLOAT3(0.3f, 2.0f, 0.4f); // зелёный
+
+		if (GetAsyncKeyState('V') & 0x8000)
+			*selectedStrength = XMFLOAT3(2.0f, 1.7f, 0.8f); // жёлто-белый
+	}
+
+	if (selectedRange != nullptr)
+	{
+		if (GetAsyncKeyState('O') & 0x8000)
+			*selectedRange -= rangeSpeed;
+
+		if (GetAsyncKeyState('P') & 0x8000)
+			*selectedRange += rangeSpeed;
+
+		if (*selectedRange < 1.0f)
+			*selectedRange = 1.0f;
+	}
+
+	// После изменения параметров пересобираем список источников света.
+	RebuildDemoLights();
 }
  
+
+void CrateApp::RebuildDemoLights()
+{
+	mRenderSys.ClearLights();
+
+	// Общий направленный свет.
+	mRenderSys.AddDirectionalLight(
+		mDirLightDir,
+		mDirLightStrength
+	);
+
+	// Первый точечный источник.
+	mRenderSys.AddPointLight(
+		mPoint1Pos,
+		mPoint1Range,
+		mPoint1Strength
+	);
+
+	// Второй точечный источник.
+	mRenderSys.AddPointLight(
+		mPoint2Pos,
+		mPoint2Range,
+		mPoint2Strength
+	);
+
+	// Spot light всегда направлен в mSpotTarget.
+	XMVECTOR spotPos = XMLoadFloat3(&mSpotPos);
+	XMVECTOR spotTarget = XMLoadFloat3(&mSpotTarget);
+	XMVECTOR spotDirV = XMVector3Normalize(spotTarget - spotPos);
+
+	XMFLOAT3 spotDir;
+	XMStoreFloat3(&spotDir, spotDirV);
+
+	mRenderSys.AddSpotLight(
+		mSpotPos,
+		spotDir,
+		mSpotRange,
+		XM_PIDIV4,
+		8.0f,
+		mSpotStrength
+	);
+}
+
+
 void CrateApp::UpdateCamera(const GameTimer& gt)
 {
 	// Convert Spherical to Cartesian coordinates.
@@ -762,15 +1002,32 @@ void CrateApp::BuildDescriptorHeaps()
 
 void CrateApp::BuildShadersAndInputLayout()
 {
-	mShaders["standardVS"] = d3dUtil::CompileShader(L"Shaders\\Default.hlsl", nullptr, "VS", "vs_5_0");
-	mShaders["opaquePS"] = d3dUtil::CompileShader(L"Shaders\\Default.hlsl", nullptr, "PS", "ps_5_0");
-	
-    mInputLayout =
-    {
-        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-        { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-		{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-    };
+	// Старые forward shaders пока оставляем.
+	mShaders["standardVS"] = d3dUtil::CompileShader(
+		L"Shaders\\Default.hlsl", nullptr, "VS", "vs_5_0");
+
+	mShaders["opaquePS"] = d3dUtil::CompileShader(
+		L"Shaders\\Default.hlsl", nullptr, "PS", "ps_5_0");
+
+	// Новые deferred shaders.
+	mShaders["deferredGeoVS"] = d3dUtil::CompileShader(
+		L"Shaders\\GeometryPass.hlsl", nullptr, "VS", "vs_5_0");
+
+	mShaders["deferredGeoPS"] = d3dUtil::CompileShader(
+		L"Shaders\\GeometryPass.hlsl", nullptr, "PS", "ps_5_0");
+
+	mShaders["deferredLightVS"] = d3dUtil::CompileShader(
+		L"Shaders\\LightingPass.hlsl", nullptr, "VS", "vs_5_0");
+
+	mShaders["deferredLightPS"] = d3dUtil::CompileShader(
+		L"Shaders\\LightingPass.hlsl", nullptr, "PS", "ps_5_0");
+
+	mInputLayout =
+	{
+		{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+		{ "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+		{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+	};
 }
 
 void CrateApp::BuildShapeGeometry()
@@ -902,6 +1159,29 @@ void CrateApp::BuildPSOs()
 	opaquePsoDesc.SampleDesc.Quality = m4xMsaaState ? (m4xMsaaQuality - 1) : 0;
 	opaquePsoDesc.DSVFormat = mDepthStencilFormat;
     ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&opaquePsoDesc, IID_PPV_ARGS(&mOpaquePSO)));
+
+	// Deferred Geometry Pass PSO.
+	D3D12_INPUT_LAYOUT_DESC inputLayoutDesc =
+	{
+		mInputLayout.data(),
+		(UINT)mInputLayout.size()
+	};
+
+	mRenderSys.BuildGeometryPSO(
+		md3dDevice.Get(),
+		inputLayoutDesc,
+		mShaders["deferredGeoVS"].Get(),
+		mShaders["deferredGeoPS"].Get(),
+		mDepthStencilFormat
+	);
+
+	// Deferred Lighting Pass PSO.
+	mRenderSys.BuildLightingPSO(
+		md3dDevice.Get(),
+		mShaders["deferredLightVS"].Get(),
+		mShaders["deferredLightPS"].Get(),
+		mBackBufferFormat
+	);
 }
 
 void CrateApp::BuildFrameResources()

@@ -7,7 +7,11 @@
 struct ObjectConstants
 {
     DirectX::XMFLOAT4X4 World = MathHelper::Identity4x4();
-	DirectX::XMFLOAT4X4 TexTransform = MathHelper::Identity4x4();
+    DirectX::XMFLOAT4X4 TexTransform = MathHelper::Identity4x4();
+    int   AnimType = 0;
+    float Pad0 = 0.0f;
+    float Pad1 = 0.0f;
+    float Pad2 = 0.0f;
 };
 
 struct PassConstants
