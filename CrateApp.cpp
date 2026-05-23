@@ -12,6 +12,7 @@
 #include "TextureAnimation.h"
 #include "RenderingSystem.h"
 #include <cfloat>
+#include <algorithm>
 
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
@@ -68,6 +69,17 @@ struct PaintLight
 	float    Pad = 0.0f;
 };
 
+struct TessellationConstants
+{
+	float MinTessFactor = 1.0f;
+	float MaxTessFactor = 8.0f;
+	float MinTessDistance = 3.0f;
+	float MaxTessDistance = 25.0f;
+
+	float DisplacementScale = 0.25f;
+	XMFLOAT3 Pad = { 0.0f, 0.0f, 0.0f };
+};
+
 class CrateApp : public D3DApp
 {
 public:
@@ -96,14 +108,18 @@ private:
 
 	void LoadTextures();
     void BuildRootSignature();
+	void BuildTessellationRootSignature();
 	void BuildDescriptorHeaps();
     void BuildShadersAndInputLayout();
     void BuildShapeGeometry();
+	void BuildTessellatedPatchGeometry();
     void BuildPSOs();
+	void BuildTessellationPSO();
     void BuildFrameResources();
     void BuildMaterials();
     void BuildRenderItems();
     void DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::vector<RenderItem*>& ritems);
+	void DrawTessellatedPatch(ID3D12GraphicsCommandList* cmdList);
 	void RebuildDemoLights();
 	void FirePaintLight();
 	bool RaycastBreakfastRoom(XMFLOAT3& hitPos, XMFLOAT3& hitNormal);
@@ -117,6 +133,8 @@ private:
 		XMFLOAT3& outNormal);
 
 	std::array<const CD3DX12_STATIC_SAMPLER_DESC, 6> GetStaticSamplers();
+	void BuildTessellationCB();
+	void UpdateTessellationCB(const GameTimer& gt);
 
 private:
 
@@ -125,6 +143,9 @@ private:
     int mCurrFrameResourceIndex = 0;
 
     UINT mCbvSrvDescriptorSize = 0;
+	UINT mTessDiffuseSrvIndex = 0;
+	UINT mTessNormalSrvIndex = 0;
+	UINT mTessDisplacementSrvIndex = 0;
 
     ComPtr<ID3D12RootSignature> mRootSignature = nullptr;
 
@@ -138,12 +159,17 @@ private:
     std::vector<D3D12_INPUT_ELEMENT_DESC> mInputLayout;
 
     ComPtr<ID3D12PipelineState> mOpaquePSO = nullptr;
+
+	ComPtr<ID3D12RootSignature> mTessRootSignature = nullptr;
+	ComPtr<ID3D12PipelineState> mTessPSO = nullptr;
  
 	// List of all the render items.
 	std::vector<std::unique_ptr<RenderItem>> mAllRitems;
 
 	// Render items divided by PSO.
 	std::vector<RenderItem*> mOpaqueRitems;
+
+	RenderItem* mTessPatchRitem = nullptr;
 
     PassConstants mMainPassCB;
 
@@ -194,6 +220,11 @@ private:
 	float    mPaintRange = 4.0f;
 
 	bool mFireKeyWasDown = false;
+
+	ComPtr<ID3D12Resource> mTessCBUpload;
+	TessellationConstants* mTessCBMapped = nullptr;
+
+	TessellationConstants mTessCB;
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance,
@@ -280,11 +311,17 @@ bool CrateApp::Initialize()
 	BuildDescriptorHeaps();
 	BuildShadersAndInputLayout();
 	BuildShapeGeometry();
+	BuildTessellatedPatchGeometry();
 	BuildMaterials();
 	BuildRenderItems();
 	BuildFrameResources();
-	BuildPSOs();
 
+	BuildTessellationRootSignature();
+
+	BuildPSOs();
+	BuildTessellationPSO();
+
+	BuildTessellationCB();
 	//
 	// Fullscreen quad для Lighting Pass.
 	// Важно: command list ещё открыт, поэтому CopyResource внутри BuildFullscreenQuad сработает.
@@ -356,6 +393,7 @@ void CrateApp::Update(const GameTimer& gt)
 	UpdateObjectCBs(gt);
 	UpdateMaterialCBs(gt);
 	UpdateMainPassCB(gt);
+	UpdateTessellationCB(gt);
 }
 
 void CrateApp::Draw(const GameTimer& gt)
@@ -412,6 +450,9 @@ void CrateApp::Draw(const GameTimer& gt)
 	// slot 1 — object CB
 	// slot 3 — material CB
 	DrawRenderItems(mCommandList.Get(), mOpaqueRitems);
+
+	// Рисуем tessellated patch в тот же GBuffer.
+	DrawTessellatedPatch(mCommandList.Get());
 
 	// Переводим GBuffer из RENDER_TARGET в PIXEL_SHADER_RESOURCE.
 	mRenderSys.EndGeometryPass(mCommandList.Get());
@@ -731,6 +772,212 @@ void CrateApp::FirePaintLight()
 	RebuildDemoLights();
 }
 
+void CrateApp::BuildTessellationCB()
+{
+	UINT64 cbSize = d3dUtil::CalcConstantBufferByteSize(sizeof(TessellationConstants));
+
+	D3D12_HEAP_PROPERTIES uploadHeap = {};
+	uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+	uploadHeap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+	uploadHeap.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+	uploadHeap.CreationNodeMask = 1;
+	uploadHeap.VisibleNodeMask = 1;
+
+	D3D12_RESOURCE_DESC bufferDesc = {};
+	bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	bufferDesc.Alignment = 0;
+	bufferDesc.Width = cbSize;
+	bufferDesc.Height = 1;
+	bufferDesc.DepthOrArraySize = 1;
+	bufferDesc.MipLevels = 1;
+	bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+	bufferDesc.SampleDesc.Count = 1;
+	bufferDesc.SampleDesc.Quality = 0;
+	bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	bufferDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+	ThrowIfFailed(md3dDevice->CreateCommittedResource(
+		&uploadHeap,
+		D3D12_HEAP_FLAG_NONE,
+		&bufferDesc,
+		D3D12_RESOURCE_STATE_GENERIC_READ,
+		nullptr,
+		IID_PPV_ARGS(&mTessCBUpload)));
+
+	ThrowIfFailed(mTessCBUpload->Map(
+		0,
+		nullptr,
+		reinterpret_cast<void**>(&mTessCBMapped)));
+
+	memcpy(mTessCBMapped, &mTessCB, sizeof(TessellationConstants));
+}
+
+void CrateApp::BuildTessellationRootSignature()
+{
+	//
+	// Tessellation pass root signature:
+	//
+	// slot 0: SRV table t0-t2
+	//         t0 = diffuse
+	//         t1 = normal map
+	//         t2 = displacement map
+	//
+	// slot 1: Object CBV b0
+	// slot 2: Pass CBV b1
+	// slot 3: Material CBV b2
+	// slot 4: Tessellation CBV b3
+	//
+
+	CD3DX12_DESCRIPTOR_RANGE texTable;
+	texTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0);
+
+	CD3DX12_ROOT_PARAMETER slotRootParameter[5];
+
+	slotRootParameter[0].InitAsDescriptorTable(
+		1,
+		&texTable,
+		D3D12_SHADER_VISIBILITY_ALL);
+
+	slotRootParameter[1].InitAsConstantBufferView(0); // b0 Object
+	slotRootParameter[2].InitAsConstantBufferView(1); // b1 Pass
+	slotRootParameter[3].InitAsConstantBufferView(2); // b2 Material
+	slotRootParameter[4].InitAsConstantBufferView(3); // b3 Tessellation
+
+	CD3DX12_STATIC_SAMPLER_DESC sampler(
+		0,
+		D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+		D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+		D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+		D3D12_TEXTURE_ADDRESS_MODE_WRAP);
+
+	CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(
+		5,
+		slotRootParameter,
+		1,
+		&sampler,
+		D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+
+	ComPtr<ID3DBlob> serializedRootSig = nullptr;
+	ComPtr<ID3DBlob> errorBlob = nullptr;
+
+	HRESULT hr = D3D12SerializeRootSignature(
+		&rootSigDesc,
+		D3D_ROOT_SIGNATURE_VERSION_1,
+		serializedRootSig.GetAddressOf(),
+		errorBlob.GetAddressOf());
+
+	if (errorBlob != nullptr)
+	{
+		::OutputDebugStringA((char*)errorBlob->GetBufferPointer());
+	}
+
+	ThrowIfFailed(hr);
+
+	ThrowIfFailed(md3dDevice->CreateRootSignature(
+		0,
+		serializedRootSig->GetBufferPointer(),
+		serializedRootSig->GetBufferSize(),
+		IID_PPV_ARGS(mTessRootSignature.GetAddressOf())));
+}
+
+void CrateApp::BuildTessellationPSO()
+{
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC tessPsoDesc;
+	ZeroMemory(&tessPsoDesc, sizeof(D3D12_GRAPHICS_PIPELINE_STATE_DESC));
+
+	tessPsoDesc.InputLayout = {
+		mInputLayout.data(),
+		(UINT)mInputLayout.size()
+	};
+
+	tessPsoDesc.pRootSignature = mTessRootSignature.Get();
+
+	tessPsoDesc.VS =
+	{
+		reinterpret_cast<BYTE*>(mShaders["tessVS"]->GetBufferPointer()),
+		mShaders["tessVS"]->GetBufferSize()
+	};
+
+	tessPsoDesc.HS =
+	{
+		reinterpret_cast<BYTE*>(mShaders["tessHS"]->GetBufferPointer()),
+		mShaders["tessHS"]->GetBufferSize()
+	};
+
+	tessPsoDesc.DS =
+	{
+		reinterpret_cast<BYTE*>(mShaders["tessDS"]->GetBufferPointer()),
+		mShaders["tessDS"]->GetBufferSize()
+	};
+
+	tessPsoDesc.PS =
+	{
+		reinterpret_cast<BYTE*>(mShaders["tessPS"]->GetBufferPointer()),
+		mShaders["tessPS"]->GetBufferSize()
+	};
+
+	tessPsoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+	tessPsoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+	tessPsoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+	tessPsoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+
+	tessPsoDesc.SampleMask = UINT_MAX;
+
+	// Важно: для tessellation нужен PATCH, не TRIANGLE.
+	tessPsoDesc.PrimitiveTopologyType =
+		D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+
+	// Пишем в тот же GBuffer, что и обычный Geometry Pass.
+	tessPsoDesc.NumRenderTargets = GBUFFER_COUNT;
+
+	for (UINT i = 0; i < GBUFFER_COUNT; ++i)
+	{
+		tessPsoDesc.RTVFormats[i] = GBUFFER_FORMATS[i];
+	}
+
+	tessPsoDesc.DSVFormat = mDepthStencilFormat;
+
+	// GBuffer у нас создаётся без MSAA, поэтому Count = 1.
+	tessPsoDesc.SampleDesc.Count = 1;
+	tessPsoDesc.SampleDesc.Quality = 0;
+
+	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(
+		&tessPsoDesc,
+		IID_PPV_ARGS(&mTessPSO)));
+}
+
+void CrateApp::UpdateTessellationCB(const GameTimer& gt)
+{
+	// Клавиши для демонстрации.
+	// I / K — увеличить / уменьшить силу displacement.
+	if (GetAsyncKeyState('I') & 0x8000)
+		mTessCB.DisplacementScale += 0.5f * gt.DeltaTime();
+
+	if (GetAsyncKeyState('K') & 0x8000)
+		mTessCB.DisplacementScale -= 0.5f * gt.DeltaTime();
+
+	if (mTessCB.DisplacementScale < 0.0f)
+		mTessCB.DisplacementScale = 0.0f;
+
+	if (mTessCB.DisplacementScale > 2.0f)
+		mTessCB.DisplacementScale = 2.0f;
+
+	// U / J — увеличить / уменьшить максимальный уровень тесселяции.
+	if (GetAsyncKeyState('U') & 0x8000)
+		mTessCB.MaxTessFactor += 8.0f * gt.DeltaTime();
+
+	if (GetAsyncKeyState('J') & 0x8000)
+		mTessCB.MaxTessFactor -= 8.0f * gt.DeltaTime();
+
+	if (mTessCB.MaxTessFactor < 1.0f)
+		mTessCB.MaxTessFactor = 1.0f;
+
+	if (mTessCB.MaxTessFactor > 16.0f)
+		mTessCB.MaxTessFactor = 16.0f;
+
+	memcpy(mTessCBMapped, &mTessCB, sizeof(TessellationConstants));
+}
+
 bool CrateApp::RaycastBreakfastRoom(XMFLOAT3& hitPos, XMFLOAT3& hitNormal)
 {
 	if (mObjMesh.Vertices.empty())
@@ -1026,7 +1273,7 @@ void CrateApp::BuildDescriptorHeaps()
 		if (!pair.second.DiffuseMapPath.empty())
 			mtlTexCount++;
 
-	UINT totalTex = 2 + mtlTexCount;
+	UINT totalTex = 2 + mtlTexCount + 3;
 
 	D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
 	srvHeapDesc.NumDescriptors = totalTex;
@@ -1210,6 +1457,153 @@ void CrateApp::BuildDescriptorHeaps()
 
 		mat.SrvHeapIndex = (int)slot++;
 	}
+	// ─────────────────────────────────────────────────────────────
+// Tessellation material textures:
+// t0 = Color
+// t1 = NormalDX
+// t2 = Displacement
+// Они должны лежать подряд в descriptor heap.
+// ─────────────────────────────────────────────────────────────
+
+	auto CreateTextureSRVFromFile = [&](
+		const std::wstring& filename,
+		const std::string& textureName,
+		UINT srvIndex)
+		{
+			DirectX::TexMetadata metadata;
+			DirectX::ScratchImage image;
+
+			HRESULT hr = DirectX::LoadFromWICFile(
+				filename.c_str(),
+				DirectX::WIC_FLAGS_NONE,
+				&metadata,
+				image);
+
+			ThrowIfFailed(hr);
+
+			ComPtr<ID3D12Resource> texResource;
+			ComPtr<ID3D12Resource> uploadResource;
+
+			D3D12_RESOURCE_DESC resDesc = {};
+			resDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+			resDesc.Width = (UINT64)metadata.width;
+			resDesc.Height = (UINT)metadata.height;
+			resDesc.DepthOrArraySize = 1;
+			resDesc.MipLevels = 1;
+			resDesc.Format = metadata.format;
+			resDesc.SampleDesc.Count = 1;
+			resDesc.SampleDesc.Quality = 0;
+			resDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+			resDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+			D3D12_HEAP_PROPERTIES defaultHeap = {};
+			defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+			ThrowIfFailed(md3dDevice->CreateCommittedResource(
+				&defaultHeap,
+				D3D12_HEAP_FLAG_NONE,
+				&resDesc,
+				D3D12_RESOURCE_STATE_COPY_DEST,
+				nullptr,
+				IID_PPV_ARGS(&texResource)));
+
+			UINT64 uploadSize = GetRequiredIntermediateSize(texResource.Get(), 0, 1);
+
+			D3D12_HEAP_PROPERTIES uploadHeap = {};
+			uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+			D3D12_RESOURCE_DESC bufferDesc = {};
+			bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+			bufferDesc.Width = uploadSize;
+			bufferDesc.Height = 1;
+			bufferDesc.DepthOrArraySize = 1;
+			bufferDesc.MipLevels = 1;
+			bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+			bufferDesc.SampleDesc.Count = 1;
+			bufferDesc.SampleDesc.Quality = 0;
+			bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+			bufferDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+			ThrowIfFailed(md3dDevice->CreateCommittedResource(
+				&uploadHeap,
+				D3D12_HEAP_FLAG_NONE,
+				&bufferDesc,
+				D3D12_RESOURCE_STATE_GENERIC_READ,
+				nullptr,
+				IID_PPV_ARGS(&uploadResource)));
+
+			const DirectX::Image* img = image.GetImage(0, 0, 0);
+
+			D3D12_SUBRESOURCE_DATA subData = {};
+			subData.pData = img->pixels;
+			subData.RowPitch = (LONG_PTR)img->rowPitch;
+			subData.SlicePitch = (LONG_PTR)img->slicePitch;
+
+			UpdateSubresources(
+				mCommandList.Get(),
+				texResource.Get(),
+				uploadResource.Get(),
+				0,
+				0,
+				1,
+				&subData);
+
+			D3D12_RESOURCE_BARRIER barrier = {};
+			barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			barrier.Transition.pResource = texResource.Get();
+			barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+			mCommandList->ResourceBarrier(1, &barrier);
+
+			CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle(
+				mSrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+
+			srvHandle.Offset(srvIndex, mCbvSrvDescriptorSize);
+
+			D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+			srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			srvDesc.Format = metadata.format;
+			srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			srvDesc.Texture2D.MostDetailedMip = 0;
+			srvDesc.Texture2D.MipLevels = 1;
+			srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+
+			md3dDevice->CreateShaderResourceView(
+				texResource.Get(),
+				&srvDesc,
+				srvHandle);
+
+			auto tex = std::make_unique<Texture>();
+			tex->Name = textureName;
+			tex->Filename = filename;
+			tex->Resource = texResource;
+			tex->UploadHeap = uploadResource;
+
+			mTextures[textureName] = std::move(tex);
+		};
+
+	// slot после woodCrate, white и всех MTL-текстур
+	mTessDiffuseSrvIndex = slot++;
+	mTessNormalSrvIndex = slot++;
+	mTessDisplacementSrvIndex = slot++;
+
+	// t0 Color, t1 Normal, t2 Displacement
+	CreateTextureSRVFromFile(
+		L"MyMaterials\\PavingStones141_2K-JPG_Color.jpg",
+		"pavingStonesColor",
+		mTessDiffuseSrvIndex);
+
+	CreateTextureSRVFromFile(
+		L"MyMaterials\\PavingStones141_2K-JPG_NormalDX.jpg",
+		"pavingStonesNormalDX",
+		mTessNormalSrvIndex);
+
+	CreateTextureSRVFromFile(
+		L"MyMaterials\\PavingStones141_2K-JPG_Displacement.jpg",
+		"pavingStonesDisplacement",
+		mTessDisplacementSrvIndex);
 }
 
 void CrateApp::BuildShadersAndInputLayout()
@@ -1233,6 +1627,18 @@ void CrateApp::BuildShadersAndInputLayout()
 
 	mShaders["deferredLightPS"] = d3dUtil::CompileShader(
 		L"Shaders\\LightingPass.hlsl", nullptr, "PS", "ps_5_0");
+
+	mShaders["tessVS"] = d3dUtil::CompileShader(
+		L"Shaders\\TessellationPass.hlsl", nullptr, "VS", "vs_5_0");
+
+	mShaders["tessHS"] = d3dUtil::CompileShader(
+		L"Shaders\\TessellationPass.hlsl", nullptr, "HS", "hs_5_0");
+
+	mShaders["tessDS"] = d3dUtil::CompileShader(
+		L"Shaders\\TessellationPass.hlsl", nullptr, "DS", "ds_5_0");
+
+	mShaders["tessPS"] = d3dUtil::CompileShader(
+		L"Shaders\\TessellationPass.hlsl", nullptr, "PS", "ps_5_0");
 
 	mInputLayout =
 	{
@@ -1338,6 +1744,116 @@ void CrateApp::BuildShapeGeometry()
 
 		mGeometries[objGeo->Name] = std::move(objGeo);
 	}
+}
+
+void CrateApp::BuildTessellatedPatchGeometry()
+{
+	float minX = FLT_MAX;
+	float maxX = -FLT_MAX;
+	float minY = FLT_MAX;
+	float minZ = FLT_MAX;
+	float maxZ = -FLT_MAX;
+
+	for (const auto& v : mObjMesh.Vertices)
+	{
+		if (v.Position.x < minX) minX = v.Position.x;
+		if (v.Position.x > maxX) maxX = v.Position.x;
+
+		if (v.Position.y < minY) minY = v.Position.y;
+
+		if (v.Position.z < minZ) minZ = v.Position.z;
+		if (v.Position.z > maxZ) maxZ = v.Position.z;
+	}
+
+	// Чуть выше настоящего пола, чтобы не было мерцания с оригинальным полом.
+	float floorY = minY + 0.3f;
+
+	// Небольшой отступ от стен, чтобы patch не залезал в стены.
+	float inset = 0.15f;
+
+	minX += inset;
+	maxX -= inset;
+	minZ += inset;
+	maxZ -= inset;
+
+	std::array<Vertex, 4> vertices;
+
+	// Чем больше UV-координаты, тем чаще повторяется текстура.
+	// Для пола лучше не растягивать одну картинку на всю комнату,
+	// а повторить её несколько раз.
+	float uvRepeat = 8.0f;
+
+	vertices[0].Pos = XMFLOAT3(minX, floorY, minZ);
+	vertices[0].Normal = XMFLOAT3(0.0f, 1.0f, 0.0f);
+	vertices[0].TexC = XMFLOAT2(0.0f, uvRepeat);
+
+	vertices[1].Pos = XMFLOAT3(maxX, floorY, minZ);
+	vertices[1].Normal = XMFLOAT3(0.0f, 1.0f, 0.0f);
+	vertices[1].TexC = XMFLOAT2(uvRepeat, uvRepeat);
+
+	vertices[2].Pos = XMFLOAT3(minX, floorY, maxZ);
+	vertices[2].Normal = XMFLOAT3(0.0f, 1.0f, 0.0f);
+	vertices[2].TexC = XMFLOAT2(0.0f, 0.0f);
+
+	vertices[3].Pos = XMFLOAT3(maxX, floorY, maxZ);
+	vertices[3].Normal = XMFLOAT3(0.0f, 1.0f, 0.0f);
+	vertices[3].TexC = XMFLOAT2(uvRepeat, 0.0f);
+
+	std::array<std::uint16_t, 4> indices =
+	{
+		0, 1, 2, 3
+	};
+
+	const UINT vbByteSize = (UINT)vertices.size() * sizeof(Vertex);
+	const UINT ibByteSize = (UINT)indices.size() * sizeof(std::uint16_t);
+
+	auto geo = std::make_unique<MeshGeometry>();
+	geo->Name = "tessPatchGeo";
+
+	ThrowIfFailed(D3DCreateBlob(vbByteSize, &geo->VertexBufferCPU));
+	CopyMemory(
+		geo->VertexBufferCPU->GetBufferPointer(),
+		vertices.data(),
+		vbByteSize
+	);
+
+	ThrowIfFailed(D3DCreateBlob(ibByteSize, &geo->IndexBufferCPU));
+	CopyMemory(
+		geo->IndexBufferCPU->GetBufferPointer(),
+		indices.data(),
+		ibByteSize
+	);
+
+	geo->VertexBufferGPU = d3dUtil::CreateDefaultBuffer(
+		md3dDevice.Get(),
+		mCommandList.Get(),
+		vertices.data(),
+		vbByteSize,
+		geo->VertexBufferUploader
+	);
+
+	geo->IndexBufferGPU = d3dUtil::CreateDefaultBuffer(
+		md3dDevice.Get(),
+		mCommandList.Get(),
+		indices.data(),
+		ibByteSize,
+		geo->IndexBufferUploader
+	);
+
+	geo->VertexByteStride = sizeof(Vertex);
+	geo->VertexBufferByteSize = vbByteSize;
+
+	geo->IndexFormat = DXGI_FORMAT_R16_UINT;
+	geo->IndexBufferByteSize = ibByteSize;
+
+	SubmeshGeometry patchSubmesh;
+	patchSubmesh.IndexCount = 4;
+	patchSubmesh.StartIndexLocation = 0;
+	patchSubmesh.BaseVertexLocation = 0;
+
+	geo->DrawArgs["tessPatch"] = patchSubmesh;
+
+	mGeometries[geo->Name] = std::move(geo);
 }
 
 void CrateApp::BuildPSOs()
@@ -1447,6 +1963,17 @@ void CrateApp::BuildMaterials()
 
 		mMaterials[objMat.Name] = std::move(mat);
 	}
+	auto tessPatchMat = std::make_unique<Material>();
+	tessPatchMat->Name = "tessPatchMat";
+	tessPatchMat->MatCBIndex = (int)mMaterials.size();
+
+	tessPatchMat->DiffuseSrvHeapIndex = mTessDiffuseSrvIndex;
+
+	tessPatchMat->DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+	tessPatchMat->FresnelR0 = XMFLOAT3(0.05f, 0.05f, 0.05f);
+	tessPatchMat->Roughness = 0.45f;
+
+	mMaterials["tessPatchMat"] = std::move(tessPatchMat);
 }
 
 void CrateApp::BuildRenderItems()
@@ -1489,6 +2016,34 @@ void CrateApp::BuildRenderItems()
 
 	for (auto& e : mAllRitems)
 		mOpaqueRitems.push_back(e.get());
+
+	if (mGeometries.count("tessPatchGeo") > 0)
+	{
+		auto tessRitem = std::make_unique<RenderItem>();
+
+		tessRitem->World = MathHelper::Identity4x4();
+		tessRitem->TexTransform = MathHelper::Identity4x4();
+
+		tessRitem->ObjCBIndex = (UINT)mAllRitems.size();
+
+		tessRitem->Mat = mMaterials["tessPatchMat"].get();
+		tessRitem->Geo = mGeometries["tessPatchGeo"].get();
+
+		// Важно: это patch topology, не triangle list.
+		tessRitem->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_4_CONTROL_POINT_PATCHLIST;
+
+		tessRitem->IndexCount = 4;
+		tessRitem->StartIndexLocation = 0;
+		tessRitem->BaseVertexLocation = 0;
+
+		tessRitem->NumFramesDirty = gNumFrameResources;
+
+		mTessPatchRitem = tessRitem.get();
+
+		// Не добавляем в mOpaqueRitems.
+		// Он должен рисоваться отдельным DrawTessellatedPatch().
+		mAllRitems.push_back(std::move(tessRitem));
+	}
 }
 
 void CrateApp::DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::vector<RenderItem*>& ritems)
@@ -1524,6 +2079,64 @@ void CrateApp::DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::ve
 
         cmdList->DrawIndexedInstanced(ri->IndexCount, 1, ri->StartIndexLocation, ri->BaseVertexLocation, 0);
     }
+}
+
+void CrateApp::DrawTessellatedPatch(ID3D12GraphicsCommandList* cmdList)
+{
+	if (mTessPatchRitem == nullptr)
+		return;
+
+	auto ri = mTessPatchRitem;
+
+	UINT objCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(ObjectConstants));
+	UINT matCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(MaterialConstants));
+
+	auto objectCB = mCurrFrameResource->ObjectCB->Resource();
+	auto matCB = mCurrFrameResource->MaterialCB->Resource();
+	auto passCB = mCurrFrameResource->PassCB->Resource();
+
+	D3D12_GPU_VIRTUAL_ADDRESS objCBAddress =
+		objectCB->GetGPUVirtualAddress() + ri->ObjCBIndex * objCBByteSize;
+
+	D3D12_GPU_VIRTUAL_ADDRESS matCBAddress =
+		matCB->GetGPUVirtualAddress() + ri->Mat->MatCBIndex * matCBByteSize;
+
+	cmdList->SetPipelineState(mTessPSO.Get());
+	cmdList->SetGraphicsRootSignature(mTessRootSignature.Get());
+
+	ID3D12DescriptorHeap* descriptorHeaps[] = { mSrvDescriptorHeap.Get() };
+	cmdList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
+
+	// Временно:
+	// t0 = slot 0 — woodCrate diffuse
+	// t1 = slot 1 — white texture
+	// t2 = slot 2 — первая OBJ/MTL texture
+	CD3DX12_GPU_DESCRIPTOR_HANDLE tex(
+		mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+
+	tex.Offset(mTessDiffuseSrvIndex, mCbvSrvDescriptorSize);
+
+	// Descriptor table содержит 3 подряд идущих SRV:
+	// t0 = Color
+	// t1 = NormalDX
+	// t2 = Displacement
+	cmdList->SetGraphicsRootDescriptorTable(0, tex);
+
+	cmdList->SetGraphicsRootConstantBufferView(1, objCBAddress);
+	cmdList->SetGraphicsRootConstantBufferView(2, passCB->GetGPUVirtualAddress());
+	cmdList->SetGraphicsRootConstantBufferView(3, matCBAddress);
+	cmdList->SetGraphicsRootConstantBufferView(4, mTessCBUpload->GetGPUVirtualAddress());
+
+	cmdList->IASetVertexBuffers(0, 1, &ri->Geo->VertexBufferView());
+	cmdList->IASetIndexBuffer(&ri->Geo->IndexBufferView());
+	cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_4_CONTROL_POINT_PATCHLIST);
+
+	cmdList->DrawIndexedInstanced(
+		ri->IndexCount,
+		1,
+		ri->StartIndexLocation,
+		ri->BaseVertexLocation,
+		0);
 }
 
 std::array<const CD3DX12_STATIC_SAMPLER_DESC, 6> CrateApp::GetStaticSamplers()
