@@ -11,6 +11,7 @@
 #include "ObjLoader.h"
 #include "TextureAnimation.h"
 #include "RenderingSystem.h"
+#include <cfloat>
 
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
@@ -58,6 +59,15 @@ struct RenderItem
 
 };
 
+struct PaintLight
+{
+	XMFLOAT3 Position = { 0.0f, 0.0f, 0.0f };
+	float    Range = 4.0f;
+
+	XMFLOAT3 Strength = { 2.0f, 0.4f, 0.2f };
+	float    Pad = 0.0f;
+};
+
 class CrateApp : public D3DApp
 {
 public:
@@ -95,6 +105,16 @@ private:
     void BuildRenderItems();
     void DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::vector<RenderItem*>& ritems);
 	void RebuildDemoLights();
+	void FirePaintLight();
+	bool RaycastBreakfastRoom(XMFLOAT3& hitPos, XMFLOAT3& hitNormal);
+	bool RayTriangleIntersect(
+		FXMVECTOR rayOrigin,
+		FXMVECTOR rayDir,
+		FXMVECTOR v0,
+		FXMVECTOR v1,
+		FXMVECTOR v2,
+		float& t,
+		XMFLOAT3& outNormal);
 
 	std::array<const CD3DX12_STATIC_SAMPLER_DESC, 6> GetStaticSamplers();
 
@@ -167,6 +187,13 @@ private:
 	XMFLOAT3 mSpotTarget = { 0.0f, 1.0f, 0.0f };
 	float    mSpotRange = 16.0f;
 	XMFLOAT3 mSpotStrength = { 2.0f, 1.7f, 0.8f };
+
+	std::vector<PaintLight> mPaintLights;
+
+	XMFLOAT3 mPaintColor = { 2.0f, 0.4f, 0.2f };
+	float    mPaintRange = 4.0f;
+
+	bool mFireKeyWasDown = false;
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance,
@@ -580,6 +607,44 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 			*selectedRange = 1.0f;
 	}
 
+	// Цвет будущего "выстрела".
+	if (GetAsyncKeyState('Z') & 0x8000)
+		mPaintColor = XMFLOAT3(2.0f, 0.4f, 0.2f); // красно-оранжевый
+
+	if (GetAsyncKeyState('X') & 0x8000)
+		mPaintColor = XMFLOAT3(0.2f, 0.5f, 2.0f); // синий
+
+	if (GetAsyncKeyState('C') & 0x8000)
+		mPaintColor = XMFLOAT3(0.3f, 2.0f, 0.4f); // зелёный
+
+	if (GetAsyncKeyState('V') & 0x8000)
+		mPaintColor = XMFLOAT3(2.0f, 1.7f, 0.8f); // жёлто-белый
+
+	// Радиус будущего пятна.
+	if (GetAsyncKeyState('O') & 0x8000)
+		mPaintRange -= rangeSpeed;
+
+	if (GetAsyncKeyState('P') & 0x8000)
+		mPaintRange += rangeSpeed;
+
+	if (mPaintRange < 1.0f)
+		mPaintRange = 1.0f;
+
+	if (mPaintRange > 20.0f)
+		mPaintRange = 20.0f;
+
+	// F — выстрелить световым пятном.
+	// Делаем защиту, чтобы один зажим F не создавал 100 источников за секунду.
+	bool fireDown = (GetAsyncKeyState('F') & 0x8000) != 0;
+
+	if (fireDown && !mFireKeyWasDown)
+	{
+		FirePaintLight();
+	}
+
+	mFireKeyWasDown = fireDown;
+
+
 	// После изменения параметров пересобираем список источников света.
 	RebuildDemoLights();
 }
@@ -589,30 +654,26 @@ void CrateApp::RebuildDemoLights()
 {
 	mRenderSys.ClearLights();
 
-	// Общий направленный свет.
 	mRenderSys.AddDirectionalLight(
 		mDirLightDir,
 		mDirLightStrength
 	);
 
-	// Первый точечный источник.
 	mRenderSys.AddPointLight(
 		mPoint1Pos,
 		mPoint1Range,
 		mPoint1Strength
 	);
 
-	// Второй точечный источник.
 	mRenderSys.AddPointLight(
 		mPoint2Pos,
 		mPoint2Range,
 		mPoint2Strength
 	);
 
-	// Spot light всегда направлен в mSpotTarget.
 	XMVECTOR spotPos = XMLoadFloat3(&mSpotPos);
 	XMVECTOR spotTarget = XMLoadFloat3(&mSpotTarget);
-	XMVECTOR spotDirV = XMVector3Normalize(spotTarget - spotPos);
+	XMVECTOR spotDirV = XMVector3Normalize(XMVectorSubtract(spotTarget, spotPos));
 
 	XMFLOAT3 spotDir;
 	XMStoreFloat3(&spotDir, spotDirV);
@@ -625,8 +686,159 @@ void CrateApp::RebuildDemoLights()
 		8.0f,
 		mSpotStrength
 	);
+
+	// Постоянные цветные пятна, которые ты "выстрелил" из камеры.
+	for (const auto& p : mPaintLights)
+	{
+		mRenderSys.AddPointLight(
+			p.Position,
+			p.Range,
+			p.Strength
+		);
+	}
 }
 
+void CrateApp::FirePaintLight()
+{
+	XMFLOAT3 hitPos;
+	XMFLOAT3 hitNormal;
+
+	if (!RaycastBreakfastRoom(hitPos, hitNormal))
+		return;
+
+	XMVECTOR pos = XMLoadFloat3(&hitPos);
+	XMVECTOR normal = XMLoadFloat3(&hitNormal);
+
+	// Чуть выносим свет от поверхности, чтобы он не оказался прямо внутри стены.
+	pos = XMVectorAdd(pos, XMVectorScale(normal, 0.08f));
+
+	PaintLight p;
+	XMStoreFloat3(&p.Position, pos);
+	p.Range = mPaintRange;
+	p.Strength = mPaintColor;
+
+	mPaintLights.push_back(p);
+
+	// Чтобы не превысить MAX_LIGHTS = 16.
+	// У нас примерно 4 базовых источника, оставим 10 пятен.
+	const size_t maxPaintLights = 10;
+
+	if (mPaintLights.size() > maxPaintLights)
+	{
+		mPaintLights.erase(mPaintLights.begin());
+	}
+
+	RebuildDemoLights();
+}
+
+bool CrateApp::RaycastBreakfastRoom(XMFLOAT3& hitPos, XMFLOAT3& hitNormal)
+{
+	if (mObjMesh.Vertices.empty())
+		return false;
+
+	XMVECTOR rayOrigin = XMLoadFloat3(&mEyePos);
+
+	// В твоей камере взгляд всегда направлен в центр сцены.
+	// Поэтому "выстрел" идёт из камеры в точку (0,0,0).
+	XMVECTOR target = XMVectorZero();
+	XMVECTOR rayDir = XMVector3Normalize(XMVectorSubtract(target, rayOrigin));
+
+	float closestT = FLT_MAX;
+	bool hit = false;
+
+	XMFLOAT3 bestNormal = { 0.0f, 1.0f, 0.0f };
+
+	for (const auto& sub : mObjMesh.SubMeshes)
+	{
+		const auto& indices = sub.Indices;
+
+		for (size_t i = 0; i + 2 < indices.size(); i += 3)
+		{
+			UINT i0 = indices[i + 0];
+			UINT i1 = indices[i + 1];
+			UINT i2 = indices[i + 2];
+
+			if (i0 >= mObjMesh.Vertices.size() ||
+				i1 >= mObjMesh.Vertices.size() ||
+				i2 >= mObjMesh.Vertices.size())
+			{
+				continue;
+			}
+
+			XMVECTOR v0 = XMLoadFloat3(&mObjMesh.Vertices[i0].Position);
+			XMVECTOR v1 = XMLoadFloat3(&mObjMesh.Vertices[i1].Position);
+			XMVECTOR v2 = XMLoadFloat3(&mObjMesh.Vertices[i2].Position);
+
+			float t = 0.0f;
+			XMFLOAT3 n;
+
+			if (RayTriangleIntersect(rayOrigin, rayDir, v0, v1, v2, t, n))
+			{
+				if (t > 0.001f && t < closestT)
+				{
+					closestT = t;
+					bestNormal = n;
+					hit = true;
+				}
+			}
+		}
+	}
+
+	if (!hit)
+		return false;
+
+	XMVECTOR hitV = XMVectorAdd(rayOrigin, XMVectorScale(rayDir, closestT));
+
+	XMStoreFloat3(&hitPos, hitV);
+	hitNormal = bestNormal;
+
+	return true;
+}
+
+bool CrateApp::RayTriangleIntersect(
+	FXMVECTOR rayOrigin,
+	FXMVECTOR rayDir,
+	FXMVECTOR v0,
+	FXMVECTOR v1,
+	FXMVECTOR v2,
+	float& t,
+	XMFLOAT3& outNormal)
+{
+	const float EPSILON = 0.000001f;
+
+	XMVECTOR edge1 = XMVectorSubtract(v1, v0);
+	XMVECTOR edge2 = XMVectorSubtract(v2, v0);
+
+	XMVECTOR h = XMVector3Cross(rayDir, edge2);
+	float a = XMVectorGetX(XMVector3Dot(edge1, h));
+
+	if (fabsf(a) < EPSILON)
+		return false;
+
+	float f = 1.0f / a;
+
+	XMVECTOR s = XMVectorSubtract(rayOrigin, v0);
+	float u = f * XMVectorGetX(XMVector3Dot(s, h));
+
+	if (u < 0.0f || u > 1.0f)
+		return false;
+
+	XMVECTOR q = XMVector3Cross(s, edge1);
+	float v = f * XMVectorGetX(XMVector3Dot(rayDir, q));
+
+	if (v < 0.0f || u + v > 1.0f)
+		return false;
+
+	t = f * XMVectorGetX(XMVector3Dot(edge2, q));
+
+	if (t <= EPSILON)
+		return false;
+
+	XMVECTOR n = XMVector3Normalize(XMVector3Cross(edge1, edge2));
+	XMStoreFloat3(&outNormal, n);
+
+	return true;
+}
 
 void CrateApp::UpdateCamera(const GameTimer& gt)
 {
