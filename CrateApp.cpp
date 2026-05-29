@@ -77,7 +77,11 @@ struct TessellationConstants
 	float MaxTessDistance = 25.0f;
 
 	float DisplacementScale = 0.25f;
-	XMFLOAT3 Pad = { 0.0f, 0.0f, 0.0f };
+
+	// Параметры волн
+	float WaveAmplitude = 0.08f;   // высота волны
+	float WaveFrequency = 2.5f;    // частота волн
+	float WaveSpeed = 2.0f;        // скорость движения волн
 };
 
 class CrateApp : public D3DApp
@@ -974,6 +978,47 @@ void CrateApp::UpdateTessellationCB(const GameTimer& gt)
 
 	if (mTessCB.MaxTessFactor > 16.0f)
 		mTessCB.MaxTessFactor = 16.0f;
+
+	// Y / H — амплитуда волн.
+	if (GetAsyncKeyState('Y') & 0x8000)
+		mTessCB.WaveAmplitude += 0.2f * gt.DeltaTime();
+
+	if (GetAsyncKeyState('H') & 0x8000)
+		mTessCB.WaveAmplitude -= 0.2f * gt.DeltaTime();
+
+	if (mTessCB.WaveAmplitude < 0.0f)
+		mTessCB.WaveAmplitude = 0.0f;
+
+	if (mTessCB.WaveAmplitude > 1.0f)
+		mTessCB.WaveAmplitude = 1.0f;
+
+
+	// T / G — частота волн.
+	if (GetAsyncKeyState('T') & 0x8000)
+		mTessCB.WaveFrequency += 3.0f * gt.DeltaTime();
+
+	if (GetAsyncKeyState('G') & 0x8000)
+		mTessCB.WaveFrequency -= 3.0f * gt.DeltaTime();
+
+	if (mTessCB.WaveFrequency < 0.1f)
+		mTessCB.WaveFrequency = 0.1f;
+
+	if (mTessCB.WaveFrequency > 20.0f)
+		mTessCB.WaveFrequency = 20.0f;
+
+
+	// R / F — скорость волн.
+	if (GetAsyncKeyState('R') & 0x8000)
+		mTessCB.WaveSpeed += 3.0f * gt.DeltaTime();
+
+	if (GetAsyncKeyState('F') & 0x8000)
+		mTessCB.WaveSpeed -= 3.0f * gt.DeltaTime();
+
+	if (mTessCB.WaveSpeed < 0.0f)
+		mTessCB.WaveSpeed = 0.0f;
+
+	if (mTessCB.WaveSpeed > 20.0f)
+		mTessCB.WaveSpeed = 20.0f;
 
 	memcpy(mTessCBMapped, &mTessCB, sizeof(TessellationConstants));
 }

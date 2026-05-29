@@ -57,13 +57,16 @@ cbuffer cbMaterial : register(b2)
 // Отдельные настройки тесселяции
 cbuffer cbTessellation : register(b3)
 {
-    float gMinTessFactor; // например 1
-    float gMaxTessFactor; // например 8
-    float gMinTessDistance; // например 3
-    float gMaxTessDistance; // например 25
+    float gMinTessFactor;
+    float gMaxTessFactor;
+    float gMinTessDistance;
+    float gMaxTessDistance;
 
-    float gDisplacementScale; // сила сдвига по height map
-    float3 gTessPad;
+    float gDisplacementScale;
+
+    float gWaveAmplitude;
+    float gWaveFrequency;
+    float gWaveSpeed;
 };
 
 struct VertexIn
@@ -214,11 +217,20 @@ DomainOut DS(PatchTess patchTess, float2 uv : SV_DomainLocation, const OutputPat
     // Берём значение из displacement map и двигаем вершину вдоль нормали.
     float height = gDisplacementMap.SampleLevel(gsamLinear, texC, 0.0f).r;
 
-    // Для пола лучше двигать вершины только вверх.
-    // Так поверхность не будет проваливаться под пол и выглядеть как плавающая волна.
+// Displacement от карты высот.
     float displacement = height * gDisplacementScale;
 
-    posL += normalL * displacement;
+// Анимированная волна.
+// Используем локальные координаты пола и время из cbPass.
+    float wave1 = sin((posL.x + gTotalTime * gWaveSpeed) * gWaveFrequency);
+    float wave2 = cos((posL.z + gTotalTime * gWaveSpeed * 0.7f) * gWaveFrequency);
+
+    float wave = (wave1 + wave2) * 0.5f;
+
+// Итоговое смещение: карта высот + волна.
+    float totalDisplacement = displacement + wave * gWaveAmplitude;
+
+    posL += normalL * totalDisplacement;
 
     float4 posW = mul(float4(posL, 1.0f), gWorld);
 
