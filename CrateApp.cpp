@@ -13,6 +13,7 @@
 #include "RenderingSystem.h"
 #include <cfloat>
 #include <algorithm>
+#include <DirectXCollision.h>
 
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
@@ -58,6 +59,9 @@ struct RenderItem
 
 	int AnimType = 0;
 
+	bool EnableFrustumCulling = false;
+	BoundingBox LocalBounds;
+
 };
 
 struct PaintLight
@@ -67,6 +71,26 @@ struct PaintLight
 
 	XMFLOAT3 Strength = { 2.0f, 0.4f, 0.2f };
 	float    Pad = 0.0f;
+};
+
+struct OctreeNode
+{
+	BoundingBox Bounds;
+
+	std::vector<RenderItem*> Objects;
+
+	std::unique_ptr<OctreeNode> Children[8];
+
+	bool IsLeaf() const
+	{
+		for (int i = 0; i < 8; ++i)
+		{
+			if (Children[i] != nullptr)
+				return false;
+		}
+
+		return true;
+	}
 };
 
 struct TessellationConstants
@@ -109,7 +133,13 @@ private:
 	void UpdateObjectCBs(const GameTimer& gt);
 	void UpdateMaterialCBs(const GameTimer& gt);
 	void UpdateMainPassCB(const GameTimer& gt);
-
+	void BuildScatterObjects();
+	void UpdateVisibleObjects();
+	void BuildOctree();
+	void InsertObjectToOctree(OctreeNode* node, RenderItem* ri, const BoundingBox& worldBounds, int depth);
+	void QueryOctree(OctreeNode* node, const BoundingFrustum& frustum);
+	void SubdivideOctreeNode(OctreeNode* node);
+	bool BoxContainsBox(const BoundingBox& outer, const BoundingBox& inner);
 	void LoadTextures();
     void BuildRootSignature();
 	void BuildTessellationRootSignature();
@@ -194,6 +224,15 @@ private:
 	float mPhi = 0.4f*XM_PI;
 	float mRadius = 2.5f;
 
+	// Free-fly camera
+	XMFLOAT3 mCameraPos = { 0.0f, 2.0f, -8.0f };
+
+	float mYaw = 0.0f;
+	float mPitch = 0.0f;
+
+	float mCameraMoveSpeed = 6.0f;
+	float mMouseSensitivity = 0.003f;
+
     POINT mLastMousePos;
 
 	int mSelectedDemoLight = 1;
@@ -229,6 +268,23 @@ private:
 	TessellationConstants* mTessCBMapped = nullptr;
 
 	TessellationConstants mTessCB;
+
+	std::vector<RenderItem*> mVisibleRitems;
+
+	bool mEnableFrustumCulling = true;
+	bool mCullingToggleKeyPressed = false;
+
+	int mNumVisibleObjects = 0;
+	int mNumCulledObjects = 0;
+
+	std::unique_ptr<OctreeNode> mOctreeRoot = nullptr;
+
+	bool mUseOctreeCulling = false;
+	bool mOctreeToggleKeyPressed = false;
+
+	int mNumOctreeNodesVisited = 0;
+	int mOctreeMaxDepth = 5;
+	int mOctreeMaxObjectsPerNode = 16;
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance,
@@ -318,6 +374,8 @@ bool CrateApp::Initialize()
 	BuildTessellatedPatchGeometry();
 	BuildMaterials();
 	BuildRenderItems();
+	BuildScatterObjects();
+	BuildOctree();
 	BuildFrameResources();
 
 	BuildTessellationRootSignature();
@@ -398,6 +456,7 @@ void CrateApp::Update(const GameTimer& gt)
 	UpdateMaterialCBs(gt);
 	UpdateMainPassCB(gt);
 	UpdateTessellationCB(gt);
+	UpdateVisibleObjects();
 }
 
 void CrateApp::Draw(const GameTimer& gt)
@@ -453,7 +512,7 @@ void CrateApp::Draw(const GameTimer& gt)
 	// slot 0 — texture
 	// slot 1 — object CB
 	// slot 3 — material CB
-	DrawRenderItems(mCommandList.Get(), mOpaqueRitems);
+	DrawRenderItems(mCommandList.Get(), mVisibleRitems);
 
 	// Рисуем tessellated patch в тот же GBuffer.
 	DrawTessellatedPatch(mCommandList.Get());
@@ -534,36 +593,420 @@ void CrateApp::OnMouseUp(WPARAM btnState, int x, int y)
 
 void CrateApp::OnMouseMove(WPARAM btnState, int x, int y)
 {
-    if((btnState & MK_LBUTTON) != 0)
-    {
-        // Make each pixel correspond to a quarter of a degree.
-        float dx = XMConvertToRadians(0.25f*static_cast<float>(x - mLastMousePos.x));
-        float dy = XMConvertToRadians(0.25f*static_cast<float>(y - mLastMousePos.y));
+	if ((btnState & MK_LBUTTON) != 0)
+	{
+		float dx = static_cast<float>(x - mLastMousePos.x);
+		float dy = static_cast<float>(y - mLastMousePos.y);
 
-        // Update angles based on input to orbit camera around box.
-        mTheta += dx;
-        mPhi += dy;
+		mYaw += dx * mMouseSensitivity;
+		mPitch -= dy * mMouseSensitivity;
 
-        // Restrict the angle mPhi.
-        mPhi = MathHelper::Clamp(mPhi, 0.1f, MathHelper::Pi - 0.1f);
-    }
-    else if((btnState & MK_RBUTTON) != 0)
-    {
-        // Make each pixel correspond to 0.2 unit in the scene.
-        float dx = 0.05f*static_cast<float>(x - mLastMousePos.x);
-        float dy = 0.05f*static_cast<float>(y - mLastMousePos.y);
+		float limit = XM_PIDIV2 - 0.05f;
 
-        // Update the camera radius based on input.
-        mRadius += dx - dy;
+		if (mPitch > limit)
+			mPitch = limit;
 
-        // Restrict the radius.
-        mRadius = MathHelper::Clamp(mRadius, 5.0f, 150.0f);
-    }
+		if (mPitch < -limit)
+			mPitch = -limit;
+	}
 
-    mLastMousePos.x = x;
-    mLastMousePos.y = y;
+	mLastMousePos.x = x;
+	mLastMousePos.y = y;
 }
  
+void CrateApp::BuildScatterObjects()
+{
+	//
+	// Добавим много небольших коробок на пол.
+	// Если ноутбук слабый — уменьшишь gridX/gridZ.
+	//
+
+	if (mGeometries.count("boxGeo") == 0)
+		return;
+
+	if (mMaterials.count("woodCrate") == 0)
+		return;
+
+	const int gridX = 20;
+	const int gridZ = 20;
+	const float spacing = 0.8f;
+
+	const float startX = -((gridX - 1) * spacing) * 0.5f;
+	const float startZ = -((gridZ - 1) * spacing) * 0.5f;
+
+	UINT nextObjIndex = (UINT)mAllRitems.size();
+
+	for (int z = 0; z < gridZ; ++z)
+	{
+		for (int x = 0; x < gridX; ++x)
+		{
+			auto ritem = std::make_unique<RenderItem>();
+
+			float px = startX + x * spacing;
+			float pz = startZ + z * spacing;
+
+			// Небольшие коробки на полу.
+			XMMATRIX S = XMMatrixScaling(0.3f, 0.3f, 0.3f);
+			XMMATRIX T = XMMatrixTranslation(px, 0.2f, pz);
+			XMMATRIX W = S * T;
+
+			XMStoreFloat4x4(&ritem->World, W);
+			XMStoreFloat4x4(&ritem->TexTransform, XMMatrixIdentity());
+
+			ritem->ObjCBIndex = nextObjIndex++;
+			ritem->Mat = mMaterials["woodCrate"].get();
+			ritem->Geo = mGeometries["boxGeo"].get();
+			ritem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+
+			auto submesh = ritem->Geo->DrawArgs["box"];
+			ritem->IndexCount = submesh.IndexCount;
+			ritem->StartIndexLocation = submesh.StartIndexLocation;
+			ritem->BaseVertexLocation = submesh.BaseVertexLocation;
+
+			ritem->NumFramesDirty = gNumFrameResources;
+
+			// Для unit-box в локальных координатах.
+			ritem->LocalBounds.Center = XMFLOAT3(0.0f, 0.0f, 0.0f);
+			ritem->LocalBounds.Extents = XMFLOAT3(0.5f, 0.5f, 0.5f);
+
+			// Эти коробки будут участвовать во frustum culling.
+			ritem->EnableFrustumCulling = true;
+
+			mOpaqueRitems.push_back(ritem.get());
+			mAllRitems.push_back(std::move(ritem));
+		}
+	}
+}
+
+
+void CrateApp::BuildOctree()
+{
+	std::vector<RenderItem*> cullableObjects;
+
+	for (auto ri : mOpaqueRitems)
+	{
+		if (ri->EnableFrustumCulling)
+		{
+			cullableObjects.push_back(ri);
+		}
+	}
+
+	if (cullableObjects.empty())
+		return;
+
+	XMFLOAT3 minP(FLT_MAX, FLT_MAX, FLT_MAX);
+	XMFLOAT3 maxP(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+
+	std::vector<BoundingBox> worldBoundsList;
+	worldBoundsList.reserve(cullableObjects.size());
+
+	for (auto ri : cullableObjects)
+	{
+		BoundingBox worldBounds;
+		XMMATRIX world = XMLoadFloat4x4(&ri->World);
+		ri->LocalBounds.Transform(worldBounds, world);
+
+		worldBoundsList.push_back(worldBounds);
+
+		XMFLOAT3 bMin(
+			worldBounds.Center.x - worldBounds.Extents.x,
+			worldBounds.Center.y - worldBounds.Extents.y,
+			worldBounds.Center.z - worldBounds.Extents.z);
+
+		XMFLOAT3 bMax(
+			worldBounds.Center.x + worldBounds.Extents.x,
+			worldBounds.Center.y + worldBounds.Extents.y,
+			worldBounds.Center.z + worldBounds.Extents.z);
+
+		if (bMin.x < minP.x) minP.x = bMin.x;
+		if (bMin.y < minP.y) minP.y = bMin.y;
+		if (bMin.z < minP.z) minP.z = bMin.z;
+
+		if (bMax.x > maxP.x) maxP.x = bMax.x;
+		if (bMax.y > maxP.y) maxP.y = bMax.y;
+		if (bMax.z > maxP.z) maxP.z = bMax.z;
+	}
+
+	XMFLOAT3 center(
+		(minP.x + maxP.x) * 0.5f,
+		(minP.y + maxP.y) * 0.5f,
+		(minP.z + maxP.z) * 0.5f);
+
+	XMFLOAT3 extents(
+		(maxP.x - minP.x) * 0.5f,
+		(maxP.y - minP.y) * 0.5f,
+		(maxP.z - minP.z) * 0.5f);
+
+	// Делаем корневой bounding box чуть больше, чтобы объекты не лежали ровно на границе.
+	extents.x += 1.0f;
+	extents.y += 1.0f;
+	extents.z += 1.0f;
+
+	// Лучше сделать root примерно кубическим, чтобы octree был нормальным.
+	float maxExtent = extents.x;
+	if (extents.y > maxExtent) maxExtent = extents.y;
+	if (extents.z > maxExtent) maxExtent = extents.z;
+
+	extents = XMFLOAT3(maxExtent, maxExtent, maxExtent);
+
+	mOctreeRoot = std::make_unique<OctreeNode>();
+	mOctreeRoot->Bounds.Center = center;
+	mOctreeRoot->Bounds.Extents = extents;
+
+	for (size_t i = 0; i < cullableObjects.size(); ++i)
+	{
+		InsertObjectToOctree(
+			mOctreeRoot.get(),
+			cullableObjects[i],
+			worldBoundsList[i],
+			0);
+	}
+}
+
+void CrateApp::SubdivideOctreeNode(OctreeNode* node)
+{
+	XMFLOAT3 c = node->Bounds.Center;
+	XMFLOAT3 e = node->Bounds.Extents;
+
+	XMFLOAT3 childExtents(
+		e.x * 0.5f,
+		e.y * 0.5f,
+		e.z * 0.5f);
+
+	int index = 0;
+
+	for (int z = -1; z <= 1; z += 2)
+	{
+		for (int y = -1; y <= 1; y += 2)
+		{
+			for (int x = -1; x <= 1; x += 2)
+			{
+				auto child = std::make_unique<OctreeNode>();
+
+				child->Bounds.Center = XMFLOAT3(
+					c.x + x * childExtents.x,
+					c.y + y * childExtents.y,
+					c.z + z * childExtents.z);
+
+				child->Bounds.Extents = childExtents;
+
+				node->Children[index++] = std::move(child);
+			}
+		}
+	}
+}
+
+bool CrateApp::BoxContainsBox(const BoundingBox& outer, const BoundingBox& inner)
+{
+	float outerMinX = outer.Center.x - outer.Extents.x;
+	float outerMinY = outer.Center.y - outer.Extents.y;
+	float outerMinZ = outer.Center.z - outer.Extents.z;
+
+	float outerMaxX = outer.Center.x + outer.Extents.x;
+	float outerMaxY = outer.Center.y + outer.Extents.y;
+	float outerMaxZ = outer.Center.z + outer.Extents.z;
+
+	float innerMinX = inner.Center.x - inner.Extents.x;
+	float innerMinY = inner.Center.y - inner.Extents.y;
+	float innerMinZ = inner.Center.z - inner.Extents.z;
+
+	float innerMaxX = inner.Center.x + inner.Extents.x;
+	float innerMaxY = inner.Center.y + inner.Extents.y;
+	float innerMaxZ = inner.Center.z + inner.Extents.z;
+
+	return
+		innerMinX >= outerMinX &&
+		innerMinY >= outerMinY &&
+		innerMinZ >= outerMinZ &&
+		innerMaxX <= outerMaxX &&
+		innerMaxY <= outerMaxY &&
+		innerMaxZ <= outerMaxZ;
+}
+
+void CrateApp::InsertObjectToOctree(
+	OctreeNode* node,
+	RenderItem* ri,
+	const BoundingBox& worldBounds,
+	int depth)
+{
+	if (depth >= mOctreeMaxDepth)
+	{
+		node->Objects.push_back(ri);
+		return;
+	}
+
+	// Если лист ещё не переполнен — кладём объект сюда.
+	if (node->IsLeaf() && (int)node->Objects.size() < mOctreeMaxObjectsPerNode)
+	{
+		node->Objects.push_back(ri);
+		return;
+	}
+
+	// Если лист переполнен — делим.
+	if (node->IsLeaf())
+	{
+		std::vector<RenderItem*> oldObjects = node->Objects;
+		node->Objects.clear();
+
+		SubdivideOctreeNode(node);
+
+		// Старые объекты у нас уже без worldBounds, поэтому безопаснее оставить их в родителе.
+		// Это проще и надёжнее для учебной реализации.
+		for (auto oldRi : oldObjects)
+		{
+			node->Objects.push_back(oldRi);
+		}
+	}
+
+	// Пытаемся положить новый объект в одного из детей.
+	for (int i = 0; i < 8; ++i)
+	{
+		if (BoxContainsBox(node->Children[i]->Bounds, worldBounds))
+		{
+			InsertObjectToOctree(
+				node->Children[i].get(),
+				ri,
+				worldBounds,
+				depth + 1);
+
+			return;
+		}
+	}
+
+	// Если объект пересекает границы нескольких детей — оставляем в текущем узле.
+	node->Objects.push_back(ri);
+}
+
+void CrateApp::QueryOctree(OctreeNode* node, const BoundingFrustum& frustum)
+{
+	if (node == nullptr)
+		return;
+
+	++mNumOctreeNodesVisited;
+
+	auto relation = frustum.Contains(node->Bounds);
+
+	if (relation == DirectX::DISJOINT)
+	{
+		// Весь узел вне камеры — сразу отбрасываем все его объекты и детей.
+		mNumCulledObjects += (int)node->Objects.size();
+		return;
+	}
+
+	// Объекты, лежащие в этом узле.
+	for (auto ri : node->Objects)
+	{
+		BoundingBox worldBounds;
+		XMMATRIX world = XMLoadFloat4x4(&ri->World);
+		ri->LocalBounds.Transform(worldBounds, world);
+
+		if (frustum.Contains(worldBounds) != DirectX::DISJOINT)
+		{
+			mVisibleRitems.push_back(ri);
+			++mNumVisibleObjects;
+		}
+		else
+		{
+			++mNumCulledObjects;
+		}
+	}
+
+	for (int i = 0; i < 8; ++i)
+	{
+		QueryOctree(node->Children[i].get(), frustum);
+	}
+}
+
+void CrateApp::UpdateVisibleObjects()
+{
+	mVisibleRitems.clear();
+
+	mNumVisibleObjects = 0;
+	mNumCulledObjects = 0;
+	mNumOctreeNodesVisited = 0;
+
+	// Если culling выключен — рисуем всё.
+	if (!mEnableFrustumCulling)
+	{
+		for (auto ri : mOpaqueRitems)
+			mVisibleRitems.push_back(ri);
+
+		mNumVisibleObjects = (int)mVisibleRitems.size();
+		mNumCulledObjects = 0;
+
+		std::wstring title = L"d3d App | Frustum Culling: OFF";
+		title += L" | Visible: " + std::to_wstring(mNumVisibleObjects);
+		title += L" | Culled: " + std::to_wstring(mNumCulledObjects);
+
+		SetWindowText(mhMainWnd, title.c_str());
+		return;
+	}
+
+	XMMATRIX proj = XMLoadFloat4x4(&mProj);
+
+	BoundingFrustum localFrustum;
+	BoundingFrustum::CreateFromMatrix(localFrustum, proj);
+
+	XMMATRIX view = XMLoadFloat4x4(&mView);
+	XMMATRIX invView = XMMatrixInverse(nullptr, view);
+
+	BoundingFrustum worldFrustum;
+	localFrustum.Transform(worldFrustum, invView);
+
+	// Объекты без culling всегда рисуем.
+	for (auto ri : mOpaqueRitems)
+	{
+		if (!ri->EnableFrustumCulling)
+		{
+			mVisibleRitems.push_back(ri);
+			++mNumVisibleObjects;
+		}
+	}
+
+	if (mUseOctreeCulling && mOctreeRoot != nullptr)
+	{
+		QueryOctree(mOctreeRoot.get(), worldFrustum);
+	}
+	else
+	{
+		for (auto ri : mOpaqueRitems)
+		{
+			if (!ri->EnableFrustumCulling)
+				continue;
+
+			BoundingBox worldBounds;
+			XMMATRIX world = XMLoadFloat4x4(&ri->World);
+			ri->LocalBounds.Transform(worldBounds, world);
+
+			if (worldFrustum.Contains(worldBounds) != DirectX::DISJOINT)
+			{
+				mVisibleRitems.push_back(ri);
+				++mNumVisibleObjects;
+			}
+			else
+			{
+				++mNumCulledObjects;
+			}
+		}
+	}
+
+	std::wstring title = L"d3d App | Frustum Culling: ON";
+
+	title += mUseOctreeCulling
+		? L" | Mode: Octree"
+		: L" | Mode: Linear";
+
+	title += L" | Visible: " + std::to_wstring(mNumVisibleObjects);
+	title += L" | Culled: " + std::to_wstring(mNumCulledObjects);
+
+	if (mUseOctreeCulling)
+	{
+		title += L" | Nodes: " + std::to_wstring(mNumOctreeNodesVisited);
+	}
+
+	SetWindowText(mhMainWnd, title.c_str());
+}
+
 void CrateApp::OnKeyboardInput(const GameTimer& gt)
 {
 	const float moveSpeed = 4.0f * gt.DeltaTime();
@@ -602,27 +1045,52 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 		selectedRange = &mSpotRange;
 	}
 
-	if (selectedPos != nullptr)
-	{
-		// Движение по сцене.
-		if (GetAsyncKeyState('A') & 0x8000)
-			selectedPos->x -= moveSpeed;
+	float dt = gt.DeltaTime();
 
-		if (GetAsyncKeyState('D') & 0x8000)
-			selectedPos->x += moveSpeed;
+	float cameraMoveSpeed = mCameraMoveSpeed * dt;
 
-		if (GetAsyncKeyState('W') & 0x8000)
-			selectedPos->z += moveSpeed;
+	if (GetAsyncKeyState(VK_SHIFT) & 0x8000)
+		cameraMoveSpeed *= 3.0f;
 
-		if (GetAsyncKeyState('S') & 0x8000)
-			selectedPos->z -= moveSpeed;
+	if (GetAsyncKeyState(VK_CONTROL) & 0x8000)
+		cameraMoveSpeed *= 0.35f;
 
-		if (GetAsyncKeyState('Q') & 0x8000)
-			selectedPos->y -= moveSpeed;
+	float cosPitch = cosf(mPitch);
+	float sinPitch = sinf(mPitch);
+	float cosYaw = cosf(mYaw);
+	float sinYaw = sinf(mYaw);
 
-		if (GetAsyncKeyState('E') & 0x8000)
-			selectedPos->y += moveSpeed;
-	}
+	XMVECTOR forward = XMVector3Normalize(XMVectorSet(
+		sinYaw * cosPitch,
+		sinPitch,
+		cosYaw * cosPitch,
+		0.0f
+	));
+
+	XMVECTOR worldUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+	XMVECTOR right = XMVector3Normalize(XMVector3Cross(worldUp, forward));
+
+	XMVECTOR pos = XMLoadFloat3(&mCameraPos);
+
+	if (GetAsyncKeyState('W') & 0x8000)
+		pos = XMVectorAdd(pos, XMVectorScale(forward, moveSpeed));
+
+	if (GetAsyncKeyState('S') & 0x8000)
+		pos = XMVectorSubtract(pos, XMVectorScale(forward, moveSpeed));
+
+	if (GetAsyncKeyState('D') & 0x8000)
+		pos = XMVectorAdd(pos, XMVectorScale(right, moveSpeed));
+
+	if (GetAsyncKeyState('A') & 0x8000)
+		pos = XMVectorSubtract(pos, XMVectorScale(right, moveSpeed));
+
+	if (GetAsyncKeyState('E') & 0x8000)
+		pos = XMVectorAdd(pos, XMVectorScale(worldUp, moveSpeed));
+
+	if (GetAsyncKeyState('Q') & 0x8000)
+		pos = XMVectorSubtract(pos, XMVectorScale(worldUp, moveSpeed));
+
+	XMStoreFloat3(&mCameraPos, pos);
 
 	if (selectedStrength != nullptr)
 	{
@@ -678,17 +1146,26 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 	if (mPaintRange > 20.0f)
 		mPaintRange = 20.0f;
 
-	// F — выстрелить световым пятном.
-	// Делаем защиту, чтобы один зажим F не создавал 100 источников за секунду.
-	bool fireDown = (GetAsyncKeyState('F') & 0x8000) != 0;
+	// 6 — включить/выключить frustum culling.
+	bool key6Down = (GetAsyncKeyState('6') & 0x8000) != 0;
 
-	if (fireDown && !mFireKeyWasDown)
+	if (key6Down && !mCullingToggleKeyPressed)
 	{
-		FirePaintLight();
+		mEnableFrustumCulling = !mEnableFrustumCulling;
 	}
 
-	mFireKeyWasDown = fireDown;
+	mCullingToggleKeyPressed = key6Down;
 
+
+	// 7 — переключить режим culling: Linear / Octree.
+	bool key7Down = (GetAsyncKeyState('7') & 0x8000) != 0;
+
+	if (key7Down && !mOctreeToggleKeyPressed)
+	{
+		mUseOctreeCulling = !mUseOctreeCulling;
+	}
+
+	mOctreeToggleKeyPressed = key7Down;
 
 	// После изменения параметров пересобираем список источников света.
 	RebuildDemoLights();
@@ -741,6 +1218,7 @@ void CrateApp::RebuildDemoLights()
 			p.Strength
 		);
 	}
+
 }
 
 void CrateApp::FirePaintLight()
@@ -1020,6 +1498,18 @@ void CrateApp::UpdateTessellationCB(const GameTimer& gt)
 	if (mTessCB.WaveSpeed > 20.0f)
 		mTessCB.WaveSpeed = 20.0f;
 
+
+	// F2 — переключить режим culling: linear / octree.
+	bool f2Down = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
+
+	if (f2Down && !mOctreeToggleKeyPressed)
+	{
+		mUseOctreeCulling = !mUseOctreeCulling;
+	}
+
+	mOctreeToggleKeyPressed = f2Down;
+
+
 	memcpy(mTessCBMapped, &mTessCB, sizeof(TessellationConstants));
 }
 
@@ -1134,18 +1624,34 @@ bool CrateApp::RayTriangleIntersect(
 
 void CrateApp::UpdateCamera(const GameTimer& gt)
 {
-	// Convert Spherical to Cartesian coordinates.
-	mEyePos.x = mRadius*sinf(mPhi)*cosf(mTheta);
-	mEyePos.z = mRadius*sinf(mPhi)*sinf(mTheta);
-	mEyePos.y = mRadius*cosf(mPhi);
+	XMVECTOR pos = XMLoadFloat3(&mCameraPos);
 
-	// Build the view matrix.
-	XMVECTOR pos = XMVectorSet(mEyePos.x, mEyePos.y, mEyePos.z, 1.0f);
-	XMVECTOR target = XMVectorZero();
-	XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+	float cosPitch = cosf(mPitch);
+	float sinPitch = sinf(mPitch);
+	float cosYaw = cosf(mYaw);
+	float sinYaw = sinf(mYaw);
+
+	// Направление взгляда камеры.
+	XMVECTOR forward = XMVector3Normalize(XMVectorSet(
+		sinYaw * cosPitch,
+		sinPitch,
+		cosYaw * cosPitch,
+		0.0f
+	));
+
+	// Правый вектор камеры.
+	XMVECTOR worldUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+	XMVECTOR right = XMVector3Normalize(XMVector3Cross(worldUp, forward));
+
+	// Настоящий up камеры.
+	XMVECTOR up = XMVector3Normalize(XMVector3Cross(forward, right));
+
+	XMVECTOR target = XMVectorAdd(pos, forward);
 
 	XMMATRIX view = XMMatrixLookAtLH(pos, target, up);
+
 	XMStoreFloat4x4(&mView, view);
+	XMStoreFloat3(&mEyePos, pos);
 }
 
 void CrateApp::AnimateMaterials(const GameTimer& gt)
