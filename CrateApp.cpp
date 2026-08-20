@@ -59,6 +59,12 @@ struct RenderItem
 
 	int AnimType = 0;
 
+	bool EnableSinusoidalAnimation = false;
+	float BaseY = 0.0f;
+	float AnimationAmplitude = 0.25f;
+	float AnimationAngularSpeed = 1.5f;
+	float AnimationPhase = 0.0f;
+
 	bool EnableFrustumCulling = false;
 	BoundingBox LocalBounds;
 
@@ -130,6 +136,7 @@ private:
     void OnKeyboardInput(const GameTimer& gt);
 	void UpdateCamera(const GameTimer& gt);
 	void AnimateMaterials(const GameTimer& gt);
+	void UpdateSinusoidalAnimations(const GameTimer& gt);
 	void UpdateObjectCBs(const GameTimer& gt);
 	void UpdateMaterialCBs(const GameTimer& gt);
 	void UpdateMainPassCB(const GameTimer& gt);
@@ -281,10 +288,13 @@ private:
 
 	bool mUseOctreeCulling = false;
 	bool mOctreeToggleKeyPressed = false;
+	bool mAnimationLodDemoMode = true;
+	bool mAnimationLodToggleKeyPressed = false;
 
 	int mNumOctreeNodesVisited = 0;
 	int mOctreeMaxDepth = 5;
 	int mOctreeMaxObjectsPerNode = 16;
+	UINT64 mAnimationFrameIndex = 0;
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance,
@@ -452,6 +462,7 @@ void CrateApp::Update(const GameTimer& gt)
     }
 
 	AnimateMaterials(gt);
+	UpdateSinusoidalAnimations(gt);
 	UpdateObjectCBs(gt);
 	UpdateMaterialCBs(gt);
 	UpdateMainPassCB(gt);
@@ -627,9 +638,11 @@ void CrateApp::BuildScatterObjects()
 	if (mMaterials.count("woodCrate") == 0)
 		return;
 
-	const int gridX = 20;
-	const int gridZ = 20;
-	const float spacing = 0.8f;
+	// Почти вдвое больше объектов, но на той же площади сцены.
+	const int gridX = 28;
+	const int gridZ = 28;
+	const float spacing = 0.56f;
+	const float baseY = 0.55f;
 
 	const float startX = -((gridX - 1) * spacing) * 0.5f;
 	const float startZ = -((gridZ - 1) * spacing) * 0.5f;
@@ -647,7 +660,7 @@ void CrateApp::BuildScatterObjects()
 
 			// Небольшие коробки на полу.
 			XMMATRIX S = XMMatrixScaling(0.3f, 0.3f, 0.3f);
-			XMMATRIX T = XMMatrixTranslation(px, 0.2f, pz);
+			XMMATRIX T = XMMatrixTranslation(px, baseY, pz);
 			XMMATRIX W = S * T;
 
 			XMStoreFloat4x4(&ritem->World, W);
@@ -664,6 +677,13 @@ void CrateApp::BuildScatterObjects()
 			ritem->BaseVertexLocation = submesh.BaseVertexLocation;
 
 			ritem->NumFramesDirty = gNumFrameResources;
+			ritem->EnableSinusoidalAnimation = true;
+			ritem->BaseY = baseY;
+			ritem->AnimationAmplitude = 0.25f;
+			// Быстрое синхронное движение подчёркивает разную частоту
+			// обновления Animation LOD.
+			ritem->AnimationAngularSpeed = 6.0f;
+			ritem->AnimationPhase = 0.0f;
 
 			// Для unit-box в локальных координатах.
 			ritem->LocalBounds.Center = XMFLOAT3(0.0f, 0.0f, 0.0f);
@@ -937,6 +957,9 @@ void CrateApp::UpdateVisibleObjects()
 		std::wstring title = L"d3d App | Frustum Culling: OFF";
 		title += L" | Visible: " + std::to_wstring(mNumVisibleObjects);
 		title += L" | Culled: " + std::to_wstring(mNumCulledObjects);
+		title += mAnimationLodDemoMode
+			? L" | AnimLOD: DEMO 1/8/30 [8]"
+			: L" | AnimLOD: NORMAL 1/2/4 [8]";
 
 		SetWindowText(mhMainWnd, title.c_str());
 		return;
@@ -1003,6 +1026,10 @@ void CrateApp::UpdateVisibleObjects()
 	{
 		title += L" | Nodes: " + std::to_wstring(mNumOctreeNodesVisited);
 	}
+
+	title += mAnimationLodDemoMode
+		? L" | AnimLOD: DEMO 1/8/30 [8]"
+		: L" | AnimLOD: NORMAL 1/2/4 [8]";
 
 	SetWindowText(mhMainWnd, title.c_str());
 }
@@ -1166,6 +1193,16 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 	}
 
 	mOctreeToggleKeyPressed = key7Down;
+
+	// 8 — обычный Animation LOD или усиленный режим для демонстрации.
+	bool key8Down = (GetAsyncKeyState('8') & 0x8000) != 0;
+
+	if (key8Down && !mAnimationLodToggleKeyPressed)
+	{
+		mAnimationLodDemoMode = !mAnimationLodDemoMode;
+	}
+
+	mAnimationLodToggleKeyPressed = key8Down;
 
 	// После изменения параметров пересобираем список источников света.
 	RebuildDemoLights();
@@ -1674,6 +1711,61 @@ void CrateApp::AnimateMaterials(const GameTimer& gt)
 		}
 	}
 	*/
+}
+
+void CrateApp::UpdateSinusoidalAnimations(const GameTimer& gt)
+{
+	++mAnimationFrameIndex;
+
+	constexpr float nearDistance = 7.0f;
+	constexpr float middleDistance = 14.0f;
+	constexpr float nearDistanceSq = nearDistance * nearDistance;
+	constexpr float middleDistanceSq = middleDistance * middleDistance;
+	constexpr UINT normalNearUpdateInterval = 1;
+	constexpr UINT normalMiddleUpdateInterval = 2;
+	constexpr UINT normalFarUpdateInterval = 4;
+	constexpr UINT demoNearUpdateInterval = 1;
+	constexpr UINT demoMiddleUpdateInterval = 8;
+	constexpr UINT demoFarUpdateInterval = 30;
+
+	const UINT nearUpdateInterval = mAnimationLodDemoMode
+		? demoNearUpdateInterval
+		: normalNearUpdateInterval;
+	const UINT middleUpdateInterval = mAnimationLodDemoMode
+		? demoMiddleUpdateInterval
+		: normalMiddleUpdateInterval;
+	const UINT farUpdateInterval = mAnimationLodDemoMode
+		? demoFarUpdateInterval
+		: normalFarUpdateInterval;
+
+	for (auto& item : mAllRitems)
+	{
+		RenderItem* ritem = item.get();
+		if (!ritem->EnableSinusoidalAnimation)
+			continue;
+
+		const float dx = ritem->World._41 - mCameraPos.x;
+		const float dy = ritem->BaseY - mCameraPos.y;
+		const float dz = ritem->World._43 - mCameraPos.z;
+		const float distanceSq = dx * dx + dy * dy + dz * dz;
+
+		UINT updateInterval = farUpdateInterval;
+		if (distanceSq < nearDistanceSq)
+			updateInterval = nearUpdateInterval;
+		else if (distanceSq < middleDistanceSq)
+			updateInterval = middleUpdateInterval;
+
+		// Распределяем редкие обновления между кадрами, чтобы дальние
+		// объекты не обновлялись все одновременно.
+		if ((mAnimationFrameIndex + ritem->ObjCBIndex) % updateInterval != 0)
+			continue;
+
+		const float phase = ritem->AnimationAngularSpeed * gt.TotalTime() +
+			ritem->AnimationPhase;
+		ritem->World._42 = ritem->BaseY +
+			ritem->AnimationAmplitude * sinf(phase);
+		ritem->NumFramesDirty = gNumFrameResources;
+	}
 }
 
 void CrateApp::UpdateObjectCBs(const GameTimer& gt)
@@ -2746,4 +2838,3 @@ std::array<const CD3DX12_STATIC_SAMPLER_DESC, 6> CrateApp::GetStaticSamplers()
 		linearWrap, linearClamp, 
 		anisotropicWrap, anisotropicClamp };
 }
-
