@@ -1,12 +1,14 @@
 // LightingPass.hlsl
-// Второй проход deferred rendering.
-// Читает GBuffer и считает финальное освещение.
+// Р’С‚РѕСЂРѕР№ РїСЂРѕС…РѕРґ deferred rendering.
+// Р§РёС‚Р°РµС‚ GBuffer Рё СЃС‡РёС‚Р°РµС‚ С„РёРЅР°Р»СЊРЅРѕРµ РѕСЃРІРµС‰РµРЅРёРµ.
 
 Texture2D gPosition : register(t0);
 Texture2D gNormal : register(t1);
 Texture2D gAlbedo : register(t2);
+Texture2DArray<float> gShadowMap : register(t3);
 
 SamplerState gsamPoint : register(s0);
+SamplerComparisonState gsamShadow : register(s1);
 
 #define LIGHT_DIRECTIONAL 0
 #define LIGHT_POINT       1
@@ -37,6 +39,17 @@ cbuffer cbLighting : register(b0)
     float3 gEyePosW;
 
     float4 gAmbientLight;
+
+    float4x4 gShadowTransforms[4];
+    float4 gCascadeSplits;
+    // x = resolution, y = inverse resolution, z = depth bias, w = normal bias.
+    float4 gShadowMapInfo;
+    // xyz = camera forward, w = maximum shadow distance.
+    float4 gCameraForward;
+
+    int gShadowsEnabled;
+    int gVisualizeCascades;
+    float2 gShadowPad;
 };
 
 struct VertexIn
@@ -55,7 +68,7 @@ VertexOut VS(VertexIn vin)
 {
     VertexOut vout;
 
-    // Вершины fullscreen quad уже находятся в NDC.
+    // Р’РµСЂС€РёРЅС‹ fullscreen quad СѓР¶Рµ РЅР°С…РѕРґСЏС‚СЃСЏ РІ NDC.
     vout.PosH = float4(vin.PosL, 1.0f);
     vout.TexC = vin.TexC;
 
@@ -131,13 +144,66 @@ float3 ComputeLightContribution(
     return (diffuse + specular) * light.Strength * attenuation;
 }
 
+int SelectShadowCascade(float viewDepth)
+{
+    int cascadeIndex = 0;
+    cascadeIndex += viewDepth > gCascadeSplits.x;
+    cascadeIndex += viewDepth > gCascadeSplits.y;
+    cascadeIndex += viewDepth > gCascadeSplits.z;
+    return min(cascadeIndex, 3);
+}
+
+float ComputeShadowFactor(
+    float3 posW,
+    float3 normalW,
+    int cascadeIndex)
+{
+    float3 biasedPosW = posW + normalW * gShadowMapInfo.w;
+    float4 shadowPos = mul(
+        float4(biasedPosW, 1.0f),
+        gShadowTransforms[cascadeIndex]);
+
+    shadowPos.xyz /= shadowPos.w;
+
+    float2 uv;
+    uv.x = shadowPos.x * 0.5f + 0.5f;
+    uv.y = -shadowPos.y * 0.5f + 0.5f;
+
+    if (shadowPos.z <= 0.0f || shadowPos.z >= 1.0f ||
+        any(uv < 0.0f) || any(uv > 1.0f))
+    {
+        return 1.0f;
+    }
+
+    float comparisonDepth = shadowPos.z - gShadowMapInfo.z;
+    float texelSize = gShadowMapInfo.y;
+    float shadow = 0.0f;
+
+    // 3x3 percentage-closer filtering.
+    [unroll]
+    for (int y = -1; y <= 1; ++y)
+    {
+        [unroll]
+        for (int x = -1; x <= 1; ++x)
+        {
+            float2 offset = float2(x, y) * texelSize;
+            shadow += gShadowMap.SampleCmpLevelZero(
+                gsamShadow,
+                float3(uv + offset, cascadeIndex),
+                comparisonDepth);
+        }
+    }
+
+    return shadow / 9.0f;
+}
+
 float4 PS(VertexOut pin) : SV_Target
 {
     float4 posData = gPosition.Sample(gsamPoint, pin.TexC);
     float4 normalData = gNormal.Sample(gsamPoint, pin.TexC);
     float4 albedoData = gAlbedo.Sample(gsamPoint, pin.TexC);
 
-    // Если GBuffer в этом пикселе пустой — возвращаем тёмный фон.
+    // Р•СЃР»Рё GBuffer РІ СЌС‚РѕРј РїРёРєСЃРµР»Рµ РїСѓСЃС‚РѕР№ вЂ” РІРѕР·РІСЂР°С‰Р°РµРј С‚С‘РјРЅС‹Р№ С„РѕРЅ.
     if (posData.w < 0.5f)
     {
         return float4(0.1f, 0.1f, 0.1f, 1.0f);
@@ -145,7 +211,7 @@ float4 PS(VertexOut pin) : SV_Target
 
     float3 posW = posData.xyz;
 
-    // Распаковка нормали из [0, 1] обратно в [-1, 1].
+    // Р Р°СЃРїР°РєРѕРІРєР° РЅРѕСЂРјР°Р»Рё РёР· [0, 1] РѕР±СЂР°С‚РЅРѕ РІ [-1, 1].
     float3 N = normalize(normalData.xyz * 2.0f - 1.0f);
 
     float3 albedo = albedoData.rgb;
@@ -155,19 +221,50 @@ float4 PS(VertexOut pin) : SV_Target
 
     float3 ambient = gAmbientLight.rgb * gAmbientLight.a * albedo;
     float3 result = ambient;
+    float viewDepth = dot(posW - gEyePosW, normalize(gCameraForward.xyz));
+    int cascadeIndex = SelectShadowCascade(viewDepth);
+    float shadowFactor = 1.0f;
+
+    if (gShadowsEnabled != 0 &&
+        viewDepth >= 0.0f &&
+        viewDepth <= gCascadeSplits.w)
+    {
+        shadowFactor = ComputeShadowFactor(posW, N, cascadeIndex);
+    }
 
     for (int i = 0; i < gLightCount && i < MAX_LIGHTS; ++i)
     {
-        result += ComputeLightContribution(
+        float3 contribution = ComputeLightContribution(
             gLights[i],
             posW,
             N,
             toEye,
             albedo,
             roughness);
+
+        if (gLights[i].Type == LIGHT_DIRECTIONAL)
+        {
+            contribution *= shadowFactor;
+        }
+
+        result += contribution;
     }
 
-    // Простая Reinhard tone mapping.
+    if (gVisualizeCascades != 0 &&
+        viewDepth >= 0.0f &&
+        viewDepth <= gCascadeSplits.w)
+    {
+        const float3 cascadeColors[4] =
+        {
+            float3(1.0f, 0.35f, 0.35f),
+            float3(0.35f, 1.0f, 0.35f),
+            float3(0.35f, 0.55f, 1.0f),
+            float3(1.0f, 0.85f, 0.3f)
+        };
+        result = lerp(result, result * cascadeColors[cascadeIndex], 0.35f);
+    }
+
+    // РџСЂРѕСЃС‚Р°СЏ Reinhard tone mapping.
     result = result / (result + 1.0f);
 
     return float4(result, 1.0f);

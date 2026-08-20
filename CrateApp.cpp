@@ -140,6 +140,7 @@ private:
 	void UpdateObjectCBs(const GameTimer& gt);
 	void UpdateMaterialCBs(const GameTimer& gt);
 	void UpdateMainPassCB(const GameTimer& gt);
+	void UpdateCascadedShadowMaps(const GameTimer& gt);
 	void BuildScatterObjects();
 	void UpdateVisibleObjects();
 	void BuildOctree();
@@ -160,6 +161,7 @@ private:
     void BuildMaterials();
     void BuildRenderItems();
     void DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::vector<RenderItem*>& ritems);
+	void DrawShadowCasters(ID3D12GraphicsCommandList* cmdList, const std::vector<RenderItem*>& ritems);
 	void DrawTessellatedPatch(ID3D12GraphicsCommandList* cmdList);
 	void RebuildDemoLights();
 	void FirePaintLight();
@@ -290,6 +292,14 @@ private:
 	bool mOctreeToggleKeyPressed = false;
 	bool mAnimationLodDemoMode = true;
 	bool mAnimationLodToggleKeyPressed = false;
+	bool mShadowsEnabled = true;
+	bool mShadowsToggleKeyPressed = false;
+	bool mVisualizeShadowCascades = false;
+	bool mCascadeDebugToggleKeyPressed = false;
+
+	std::array<ShadowPassConstants, SHADOW_CASCADE_COUNT> mShadowPassConstants = {};
+	std::array<XMFLOAT4X4, SHADOW_CASCADE_COUNT> mShadowTransforms = {};
+	XMFLOAT4 mCascadeSplits = {};
 
 	int mNumOctreeNodesVisited = 0;
 	int mOctreeMaxDepth = 5;
@@ -368,6 +378,7 @@ bool CrateApp::Initialize()
 
 	mRenderSys.BuildGeometryRootSignature(md3dDevice.Get());
 	mRenderSys.BuildLightingRootSignature(md3dDevice.Get());
+	mRenderSys.BuildShadowRootSignature(md3dDevice.Get());
 
 	//
 	// Источники света теперь создаются через demo-поля:
@@ -466,6 +477,7 @@ void CrateApp::Update(const GameTimer& gt)
 	UpdateObjectCBs(gt);
 	UpdateMaterialCBs(gt);
 	UpdateMainPassCB(gt);
+	UpdateCascadedShadowMaps(gt);
 	UpdateTessellationCB(gt);
 	UpdateVisibleObjects();
 }
@@ -479,6 +491,29 @@ void CrateApp::Draw(const GameTimer& gt)
 
 	// PSO можно передать nullptr, потому что нужные PSO выставит RenderingSystem.
 	ThrowIfFailed(mCommandList->Reset(cmdListAlloc.Get(), nullptr));
+
+	//
+	// 0. CASCADED SHADOW PASS
+	// Каждый срез Texture2DArray получает depth направленного света.
+	//
+	if (mShadowsEnabled)
+	{
+		mRenderSys.BeginShadowPass(mCommandList.Get());
+
+		for (UINT cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade)
+		{
+			mRenderSys.SetShadowCascade(
+				mCommandList.Get(),
+				cascade,
+				mShadowPassConstants[cascade]);
+
+			// Используем все opaque-объекты, а не только camera-visible:
+			// объект вне кадра тоже может отбрасывать тень внутрь кадра.
+			DrawShadowCasters(mCommandList.Get(), mOpaqueRitems);
+		}
+
+		mRenderSys.EndShadowPass(mCommandList.Get());
+	}
 
 	//
 	// ─────────────────────────────────────────────
@@ -960,6 +995,11 @@ void CrateApp::UpdateVisibleObjects()
 		title += mAnimationLodDemoMode
 			? L" | AnimLOD: DEMO 1/8/30 [8]"
 			: L" | AnimLOD: NORMAL 1/2/4 [8]";
+		title += mShadowsEnabled
+			? L" | CSM: ON [9]"
+			: L" | CSM: OFF [9]";
+		if (mVisualizeShadowCascades)
+			title += L" | Cascades: DEBUG [0]";
 
 		SetWindowText(mhMainWnd, title.c_str());
 		return;
@@ -1030,6 +1070,11 @@ void CrateApp::UpdateVisibleObjects()
 	title += mAnimationLodDemoMode
 		? L" | AnimLOD: DEMO 1/8/30 [8]"
 		: L" | AnimLOD: NORMAL 1/2/4 [8]";
+	title += mShadowsEnabled
+		? L" | CSM: ON [9]"
+		: L" | CSM: OFF [9]";
+	if (mVisualizeShadowCascades)
+		title += L" | Cascades: DEBUG [0]";
 
 	SetWindowText(mhMainWnd, title.c_str());
 }
@@ -1203,6 +1248,26 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 	}
 
 	mAnimationLodToggleKeyPressed = key8Down;
+
+	// 9 — включить/выключить каскадные тени.
+	bool key9Down = (GetAsyncKeyState('9') & 0x8000) != 0;
+
+	if (key9Down && !mShadowsToggleKeyPressed)
+	{
+		mShadowsEnabled = !mShadowsEnabled;
+	}
+
+	mShadowsToggleKeyPressed = key9Down;
+
+	// 0 — цветная визуализация границ каскадов.
+	bool key0Down = (GetAsyncKeyState('0') & 0x8000) != 0;
+
+	if (key0Down && !mCascadeDebugToggleKeyPressed)
+	{
+		mVisualizeShadowCascades = !mVisualizeShadowCascades;
+	}
+
+	mCascadeDebugToggleKeyPressed = key0Down;
 
 	// После изменения параметров пересобираем список источников света.
 	RebuildDemoLights();
@@ -1689,6 +1754,161 @@ void CrateApp::UpdateCamera(const GameTimer& gt)
 
 	XMStoreFloat4x4(&mView, view);
 	XMStoreFloat3(&mEyePos, pos);
+}
+
+void CrateApp::UpdateCascadedShadowMaps(const GameTimer& gt)
+{
+	constexpr float cameraNear = 1.0f;
+	constexpr float shadowDistance = 60.0f;
+	constexpr float splitLambda = 0.75f;
+	constexpr float casterDepthPadding = 50.0f;
+	const float cameraFovY = 0.25f * MathHelper::Pi;
+
+	float splitDistances[SHADOW_CASCADE_COUNT] = {};
+
+	for (UINT cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade)
+	{
+		float fraction =
+			static_cast<float>(cascade + 1) /
+			static_cast<float>(SHADOW_CASCADE_COUNT);
+		float logarithmic =
+			cameraNear * powf(shadowDistance / cameraNear, fraction);
+		float uniform =
+			cameraNear + (shadowDistance - cameraNear) * fraction;
+
+		// Practical split scheme: nonlinear logarithmic detail near the camera,
+		// blended with a uniform distribution for stable cascade sizes.
+		splitDistances[cascade] =
+			splitLambda * logarithmic +
+			(1.0f - splitLambda) * uniform;
+	}
+
+	mCascadeSplits = XMFLOAT4(
+		splitDistances[0],
+		splitDistances[1],
+		splitDistances[2],
+		splitDistances[3]);
+
+	XMMATRIX cameraView = XMLoadFloat4x4(&mView);
+	XMVECTOR lightDirection = XMVector3Normalize(
+		XMLoadFloat3(&mDirLightDir));
+	XMVECTOR worldUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+
+	if (fabsf(XMVectorGetX(XMVector3Dot(lightDirection, worldUp))) > 0.95f)
+	{
+		worldUp = XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f);
+	}
+
+	float cascadeNear = cameraNear;
+
+	for (UINT cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade)
+	{
+		float cascadeFar = splitDistances[cascade];
+		XMMATRIX cascadeProjection = XMMatrixPerspectiveFovLH(
+			cameraFovY,
+			AspectRatio(),
+			cascadeNear,
+			cascadeFar);
+		XMMATRIX inverseCascadeViewProjection = XMMatrixInverse(
+			nullptr,
+			cameraView * cascadeProjection);
+
+		XMVECTOR frustumCorners[8];
+		UINT cornerIndex = 0;
+
+		for (UINT z = 0; z < 2; ++z)
+		{
+			float ndcZ = z == 0 ? 0.0f : 1.0f;
+
+			for (UINT y = 0; y < 2; ++y)
+			{
+				float ndcY = y == 0 ? -1.0f : 1.0f;
+
+				for (UINT x = 0; x < 2; ++x)
+				{
+					float ndcX = x == 0 ? -1.0f : 1.0f;
+					frustumCorners[cornerIndex++] = XMVector3TransformCoord(
+						XMVectorSet(ndcX, ndcY, ndcZ, 1.0f),
+						inverseCascadeViewProjection);
+				}
+			}
+		}
+
+		XMVECTOR cascadeCenter = XMVectorZero();
+		for (XMVECTOR corner : frustumCorners)
+		{
+			cascadeCenter = XMVectorAdd(cascadeCenter, corner);
+		}
+		cascadeCenter = XMVectorScale(cascadeCenter, 1.0f / 8.0f);
+
+		float cascadeRadius = 0.0f;
+		for (XMVECTOR corner : frustumCorners)
+		{
+			float distance = XMVectorGetX(
+				XMVector3Length(XMVectorSubtract(corner, cascadeCenter)));
+			cascadeRadius = (std::max)(cascadeRadius, distance);
+		}
+
+		// Quantizing the radius prevents tiny projection-size changes.
+		cascadeRadius = ceilf(cascadeRadius * 16.0f) / 16.0f;
+
+		float lightDistance = cascadeRadius + casterDepthPadding;
+		XMVECTOR lightPosition = XMVectorSubtract(
+			cascadeCenter,
+			XMVectorScale(lightDirection, lightDistance));
+		XMMATRIX lightView = XMMatrixLookAtLH(
+			lightPosition,
+			cascadeCenter,
+			worldUp);
+
+		float minLightZ = FLT_MAX;
+		float maxLightZ = -FLT_MAX;
+
+		for (XMVECTOR corner : frustumCorners)
+		{
+			XMVECTOR cornerLightSpace =
+				XMVector3TransformCoord(corner, lightView);
+			float zValue = XMVectorGetZ(cornerLightSpace);
+			minLightZ = (std::min)(minLightZ, zValue);
+			maxLightZ = (std::max)(maxLightZ, zValue);
+		}
+
+		float nearLightZ = (std::max)(
+			0.1f,
+			minLightZ - casterDepthPadding);
+		float farLightZ = maxLightZ + casterDepthPadding;
+
+		XMMATRIX lightProjection = XMMatrixOrthographicOffCenterLH(
+			-cascadeRadius,
+			cascadeRadius,
+			-cascadeRadius,
+			cascadeRadius,
+			nearLightZ,
+			farLightZ);
+		XMMATRIX lightViewProjection = lightView * lightProjection;
+
+		XMStoreFloat4x4(
+			&mShadowTransforms[cascade],
+			XMMatrixTranspose(lightViewProjection));
+		mShadowPassConstants[cascade].LightViewProj =
+			mShadowTransforms[cascade];
+		mShadowPassConstants[cascade].TotalTime = gt.TotalTime();
+
+		cascadeNear = cascadeFar;
+	}
+
+	float cosPitch = cosf(mPitch);
+	XMFLOAT3 cameraForward(
+		sinf(mYaw) * cosPitch,
+		sinf(mPitch),
+		cosf(mYaw) * cosPitch);
+
+	mRenderSys.SetShadowData(
+		mShadowTransforms,
+		mCascadeSplits,
+		cameraForward,
+		mShadowsEnabled,
+		mVisualizeShadowCascades);
 }
 
 void CrateApp::AnimateMaterials(const GameTimer& gt)
@@ -2271,6 +2491,9 @@ void CrateApp::BuildShadersAndInputLayout()
 	mShaders["deferredLightPS"] = d3dUtil::CompileShader(
 		L"Shaders\\LightingPass.hlsl", nullptr, "PS", "ps_5_0");
 
+	mShaders["shadowVS"] = d3dUtil::CompileShader(
+		L"Shaders\\ShadowPass.hlsl", nullptr, "VS", "vs_5_0");
+
 	mShaders["tessVS"] = d3dUtil::CompileShader(
 		L"Shaders\\TessellationPass.hlsl", nullptr, "VS", "vs_5_0");
 
@@ -2546,6 +2769,12 @@ void CrateApp::BuildPSOs()
 		mDepthStencilFormat
 	);
 
+	mRenderSys.BuildShadowPSO(
+		md3dDevice.Get(),
+		inputLayoutDesc,
+		mShaders["shadowVS"].Get()
+	);
+
 	// Deferred Lighting Pass PSO.
 	mRenderSys.BuildLightingPSO(
 		md3dDevice.Get(),
@@ -2686,6 +2915,37 @@ void CrateApp::BuildRenderItems()
 		// Не добавляем в mOpaqueRitems.
 		// Он должен рисоваться отдельным DrawTessellatedPatch().
 		mAllRitems.push_back(std::move(tessRitem));
+	}
+}
+
+void CrateApp::DrawShadowCasters(
+	ID3D12GraphicsCommandList* cmdList,
+	const std::vector<RenderItem*>& ritems)
+{
+	UINT objCBByteSize =
+		d3dUtil::CalcConstantBufferByteSize(sizeof(ObjectConstants));
+	auto objectCB = mCurrFrameResource->ObjectCB->Resource();
+
+	for (RenderItem* ri : ritems)
+	{
+		if (ri == nullptr || ri->Geo == nullptr)
+			continue;
+
+		cmdList->IASetVertexBuffers(0, 1, &ri->Geo->VertexBufferView());
+		cmdList->IASetIndexBuffer(&ri->Geo->IndexBufferView());
+		cmdList->IASetPrimitiveTopology(ri->PrimitiveType);
+
+		D3D12_GPU_VIRTUAL_ADDRESS objCBAddress =
+			objectCB->GetGPUVirtualAddress() +
+			ri->ObjCBIndex * objCBByteSize;
+
+		cmdList->SetGraphicsRootConstantBufferView(0, objCBAddress);
+		cmdList->DrawIndexedInstanced(
+			ri->IndexCount,
+			1,
+			ri->StartIndexLocation,
+			ri->BaseVertexLocation,
+			0);
 	}
 }
 
