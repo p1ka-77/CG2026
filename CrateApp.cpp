@@ -11,6 +11,7 @@
 #include "ObjLoader.h"
 #include "TextureAnimation.h"
 #include "RenderingSystem.h"
+#include "ParticleSystem.h"
 #include <cfloat>
 #include <algorithm>
 #include <DirectXCollision.h>
@@ -223,6 +224,7 @@ private:
 	ObjMesh         mObjMesh;
 
 	RenderingSystem mRenderSys;
+	ParticleSystem mParticleSystem;
 
 	ComPtr<ID3D12Resource> mUVAnimCBUpload;
 	UVAnimCB* mUVAnimCBMapped = nullptr;
@@ -246,9 +248,9 @@ private:
 
 	int mSelectedDemoLight = 1;
 
-	// Directional light
-	XMFLOAT3 mDirLightDir = { 0.577f, -0.577f, 0.577f };
-	XMFLOAT3 mDirLightStrength = { 0.35f, 0.35f, 0.35f };
+	// Внешний направленный свет (солнце) для каскадных теней.
+	XMFLOAT3 mDirLightDir = { 0.45f, -0.80f, 0.35f };
+	XMFLOAT3 mDirLightStrength = { 2.0f, 1.85f, 1.55f };
 
 	// Point light 1
 	XMFLOAT3 mPoint1Pos = { -3.0f, 2.2f, 1.5f };
@@ -296,6 +298,8 @@ private:
 	bool mShadowsToggleKeyPressed = false;
 	bool mVisualizeShadowCascades = false;
 	bool mCascadeDebugToggleKeyPressed = false;
+	bool mParticlesEnabled = true;
+	bool mParticlesToggleKeyPressed = false;
 
 	std::array<ShadowPassConstants, SHADOW_CASCADE_COUNT> mShadowPassConstants = {};
 	std::array<XMFLOAT4X4, SHADOW_CASCADE_COUNT> mShadowTransforms = {};
@@ -405,6 +409,13 @@ bool CrateApp::Initialize()
 	BuildTessellationPSO();
 
 	BuildTessellationCB();
+
+	mParticleSystem.Initialize(
+		md3dDevice.Get(),
+		mCommandList.Get(),
+		1024,
+		gNumFrameResources,
+		mDepthStencilFormat);
 	//
 	// Fullscreen quad для Lighting Pass.
 	// Важно: command list ещё открыт, поэтому CopyResource внутри BuildFullscreenQuad сработает.
@@ -422,6 +433,7 @@ bool CrateApp::Initialize()
 	FlushCommandQueue();
 
 	mTexMgr.ReleaseUploadHeaps();
+	mParticleSystem.ReleaseInitializationUpload();
 
 	return true;
 }
@@ -491,6 +503,18 @@ void CrateApp::Draw(const GameTimer& gt)
 
 	// PSO можно передать nullptr, потому что нужные PSO выставит RenderingSystem.
 	ThrowIfFailed(mCommandList->Reset(cmdListAlloc.Get(), nullptr));
+
+	if (mParticlesEnabled)
+	{
+		mParticleSystem.Update(
+			mCommandList.Get(),
+			gt.DeltaTime(),
+			gt.TotalTime(),
+			XMLoadFloat4x4(&mView),
+			XMLoadFloat4x4(&mProj),
+			mEyePos,
+			mCurrFrameResourceIndex);
+	}
 
 	//
 	// 0. CASCADED SHADOW PASS
@@ -563,6 +587,12 @@ void CrateApp::Draw(const GameTimer& gt)
 	// Рисуем tessellated patch в тот же GBuffer.
 	DrawTessellatedPatch(mCommandList.Get());
 
+	// Непрозрачные billboards тоже записываются в GBuffer.
+	if (mParticlesEnabled)
+	{
+		mParticleSystem.Draw(mCommandList.Get());
+	}
+
 	// Переводим GBuffer из RENDER_TARGET в PIXEL_SHADER_RESOURCE.
 	mRenderSys.EndGeometryPass(mCommandList.Get());
 
@@ -595,7 +625,7 @@ void CrateApp::Draw(const GameTimer& gt)
 		mScreenViewport,
 		mScissorRect,
 		mEyePos,
-		XMFLOAT4(0.15f, 0.15f, 0.15f, 1.0f)
+		XMFLOAT4(0.05f, 0.05f, 0.05f, 1.0f)
 	);
 
 	auto barrierToPresent = CD3DX12_RESOURCE_BARRIER::Transition(
@@ -673,6 +703,9 @@ void CrateApp::BuildScatterObjects()
 	if (mMaterials.count("woodCrate") == 0)
 		return;
 
+	if (mMaterials.count("shadowFloorMat") == 0)
+		return;
+
 	// Почти вдвое больше объектов, но на той же площади сцены.
 	const int gridX = 28;
 	const int gridZ = 28;
@@ -683,6 +716,44 @@ void CrateApp::BuildScatterObjects()
 	const float startZ = -((gridZ - 1) * spacing) * 0.5f;
 
 	UINT nextObjIndex = (UINT)mAllRitems.size();
+
+	// Отдельная матовая платформа непосредственно под ящиками.
+	// Верхняя грань находится на Y=0.15 — в нижней точке анимации
+	// ящики почти касаются пола, поэтому контактные тени хорошо видны.
+	{
+		auto floorRitem = std::make_unique<RenderItem>();
+
+		XMMATRIX floorScale = XMMatrixScaling(18.0f, 0.1f, 18.0f);
+		XMMATRIX floorTranslation = XMMatrixTranslation(0.0f, 0.10f, 0.0f);
+		XMStoreFloat4x4(
+			&floorRitem->World,
+			floorScale * floorTranslation);
+		XMStoreFloat4x4(
+			&floorRitem->TexTransform,
+			XMMatrixIdentity());
+
+		floorRitem->ObjCBIndex = nextObjIndex++;
+		floorRitem->Mat = mMaterials["shadowFloorMat"].get();
+		floorRitem->Geo = mGeometries["boxGeo"].get();
+		floorRitem->PrimitiveType =
+			D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+
+		auto floorSubmesh = floorRitem->Geo->DrawArgs["box"];
+		floorRitem->IndexCount = floorSubmesh.IndexCount;
+		floorRitem->StartIndexLocation =
+			floorSubmesh.StartIndexLocation;
+		floorRitem->BaseVertexLocation =
+			floorSubmesh.BaseVertexLocation;
+		floorRitem->NumFramesDirty = gNumFrameResources;
+		floorRitem->LocalBounds.Center =
+			XMFLOAT3(0.0f, 0.0f, 0.0f);
+		floorRitem->LocalBounds.Extents =
+			XMFLOAT3(0.5f, 0.5f, 0.5f);
+		floorRitem->EnableFrustumCulling = true;
+
+		mOpaqueRitems.push_back(floorRitem.get());
+		mAllRitems.push_back(std::move(floorRitem));
+	}
 
 	for (int z = 0; z < gridZ; ++z)
 	{
@@ -1000,6 +1071,9 @@ void CrateApp::UpdateVisibleObjects()
 			: L" | CSM: OFF [9]";
 		if (mVisualizeShadowCascades)
 			title += L" | Cascades: DEBUG [0]";
+		title += mParticlesEnabled
+			? L" | Particles: ON [4]"
+			: L" | Particles: OFF [4]";
 
 		SetWindowText(mhMainWnd, title.c_str());
 		return;
@@ -1075,6 +1149,9 @@ void CrateApp::UpdateVisibleObjects()
 		: L" | CSM: OFF [9]";
 	if (mVisualizeShadowCascades)
 		title += L" | Cascades: DEBUG [0]";
+	title += mParticlesEnabled
+		? L" | Particles: ON [4]"
+		: L" | Particles: OFF [4]";
 
 	SetWindowText(mhMainWnd, title.c_str());
 }
@@ -1268,6 +1345,16 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 	}
 
 	mCascadeDebugToggleKeyPressed = key0Down;
+
+	// 4 — включить/выключить GPU particle system.
+	bool key4Down = (GetAsyncKeyState('4') & 0x8000) != 0;
+
+	if (key4Down && !mParticlesToggleKeyPressed)
+	{
+		mParticlesEnabled = !mParticlesEnabled;
+	}
+
+	mParticlesToggleKeyPressed = key4Down;
 
 	// После изменения параметров пересобираем список источников света.
 	RebuildDemoLights();
@@ -2804,6 +2891,17 @@ void CrateApp::BuildMaterials()
 	woodCrate->Roughness = 0.2f;
 
 	mMaterials["woodCrate"] = std::move(woodCrate);
+
+	auto shadowFloorMat = std::make_unique<Material>();
+	shadowFloorMat->Name = "shadowFloorMat";
+	shadowFloorMat->MatCBIndex = (int)mMaterials.size();
+	shadowFloorMat->DiffuseSrvHeapIndex = 1; // белая служебная текстура
+	shadowFloorMat->DiffuseAlbedo =
+		XMFLOAT4(0.52f, 0.56f, 0.62f, 1.0f);
+	shadowFloorMat->FresnelR0 = XMFLOAT3(0.02f, 0.02f, 0.02f);
+	shadowFloorMat->Roughness = 0.95f;
+
+	mMaterials["shadowFloorMat"] = std::move(shadowFloorMat);
 
 	for (auto& pair : mObjMesh.Materials)
 	{
