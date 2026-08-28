@@ -12,6 +12,7 @@
 #include "TextureAnimation.h"
 #include "RenderingSystem.h"
 #include "ParticleSystem.h"
+#include "PostProcessSystem.h"
 #include <cfloat>
 #include <algorithm>
 #include <DirectXCollision.h>
@@ -180,6 +181,7 @@ private:
 	void BuildTessellationCB();
 	void UpdateTessellationCB(const GameTimer& gt);
 
+    void AppendPostProcessStatus(std::wstring& title) const;
 private:
 
     std::vector<std::unique_ptr<FrameResource>> mFrameResources;
@@ -226,6 +228,7 @@ private:
 	RenderingSystem mRenderSys;
 	ParticleSystem mParticleSystem;
 
+    PostProcessSystem mPostProcessSystem;
 	ComPtr<ID3D12Resource> mUVAnimCBUpload;
 	UVAnimCB* mUVAnimCBMapped = nullptr;
 	XMFLOAT4X4 mView = MathHelper::Identity4x4();
@@ -301,6 +304,11 @@ private:
 	bool mParticlesEnabled = true;
 	bool mParticlesToggleKeyPressed = false;
 
+    bool mPostProcessEnabled = true;
+    bool mPostProcessToggleKeyPressed = false;
+    bool mPostProcessCycleKeyPressed = false;
+    UINT mPostProcessMode = 3;
+    float mPostProcessStrength = 1.0f;
 	std::array<ShadowPassConstants, SHADOW_CASCADE_COUNT> mShadowPassConstants = {};
 	std::array<XMFLOAT4X4, SHADOW_CASCADE_COUNT> mShadowTransforms = {};
 	XMFLOAT4 mCascadeSplits = {};
@@ -410,6 +418,13 @@ bool CrateApp::Initialize()
 
 	BuildTessellationCB();
 
+    mPostProcessSystem.Initialize(
+        md3dDevice.Get(),
+        mClientWidth,
+        mClientHeight,
+        mBackBufferFormat,
+        mRenderSys.GetGBuffer().GetSRVHeap());
+
 	mParticleSystem.Initialize(
 		md3dDevice.Get(),
 		mCommandList.Get(),
@@ -457,6 +472,12 @@ void CrateApp::OnResize()
 			mClientWidth,
 			mClientHeight
 		);
+
+        mPostProcessSystem.OnResize(
+            md3dDevice.Get(),
+            mClientWidth,
+            mClientHeight,
+            mRenderSys.GetGBuffer().GetSRVHeap());
 	}
 }
 
@@ -619,14 +640,35 @@ void CrateApp::Draw(const GameTimer& gt)
 		nullptr
 	);
 
+    D3D12_CPU_DESCRIPTOR_HANDLE lightingTarget = CurrentBackBufferView();
+    if (mPostProcessEnabled)
+    {
+        // Lighting first writes the fully lit frame into an off-screen texture.
+        mPostProcessSystem.BeginSceneColorPass(mCommandList.Get());
+        lightingTarget = mPostProcessSystem.GetSceneColorRTV();
+    }
+
 	mRenderSys.LightingPass(
 		mCommandList.Get(),
-		CurrentBackBufferView(),
+        lightingTarget,
 		mScreenViewport,
 		mScissorRect,
 		mEyePos,
 		XMFLOAT4(0.05f, 0.05f, 0.05f, 1.0f)
 	);
+
+    if (mPostProcessEnabled)
+    {
+        mPostProcessSystem.EndSceneColorPass(mCommandList.Get());
+        mPostProcessSystem.Draw(
+            mCommandList.Get(),
+            CurrentBackBufferView(),
+            mScreenViewport,
+            mScissorRect,
+            mPostProcessMode,
+            mPostProcessStrength);
+    }
+
 
 	auto barrierToPresent = CD3DX12_RESOURCE_BARRIER::Transition(
 		CurrentBackBuffer(),
@@ -1074,6 +1116,7 @@ void CrateApp::UpdateVisibleObjects()
 		title += mParticlesEnabled
 			? L" | Particles: ON [4]"
 			: L" | Particles: OFF [4]";
+        AppendPostProcessStatus(title);
 
 		SetWindowText(mhMainWnd, title.c_str());
 		return;
@@ -1152,8 +1195,31 @@ void CrateApp::UpdateVisibleObjects()
 	title += mParticlesEnabled
 		? L" | Particles: ON [4]"
 		: L" | Particles: OFF [4]";
+    AppendPostProcessStatus(title);
 
 	SetWindowText(mhMainWnd, title.c_str());
+}
+
+void CrateApp::AppendPostProcessStatus(std::wstring& title) const
+{
+    if (!mPostProcessEnabled)
+    {
+        title += L" | PostFX: OFF [5]";
+        return;
+    }
+
+    const wchar_t* modeName = L"GRAYSCALE";
+    if (mPostProcessMode == 2)
+        modeName = L"OUTLINES";
+    else if (mPostProcessMode == 3)
+        modeName = L"BOTH";
+
+    title += L" | PostFX: ";
+    title += modeName;
+    title += L" [5/B]";
+    title += L" | FX: " + std::to_wstring(
+        static_cast<int>(mPostProcessStrength * 100.0f + 0.5f));
+    title += L"% [N/M]";
 }
 
 void CrateApp::OnKeyboardInput(const GameTimer& gt)
@@ -1355,6 +1421,33 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 	}
 
 	mParticlesToggleKeyPressed = key4Down;
+
+    // 5 - completely bypass/enable the final post-processing pass.
+    bool key5Down = (GetAsyncKeyState('5') & 0x8000) != 0;
+    if (key5Down && !mPostProcessToggleKeyPressed)
+    {
+        mPostProcessEnabled = !mPostProcessEnabled;
+    }
+    mPostProcessToggleKeyPressed = key5Down;
+
+    // B - cycle: grayscale -> GBuffer outlines -> both effects.
+    bool keyBDown = (GetAsyncKeyState('B') & 0x8000) != 0;
+    if (keyBDown && !mPostProcessCycleKeyPressed)
+    {
+        mPostProcessMode = mPostProcessMode % 3 + 1;
+    }
+    mPostProcessCycleKeyPressed = keyBDown;
+
+    // N/M - smoothly decrease/increase the effect strength.
+    const float postProcessAdjustmentSpeed = 0.8f * gt.DeltaTime();
+    if (GetAsyncKeyState('N') & 0x8000)
+        mPostProcessStrength -= postProcessAdjustmentSpeed;
+    if (GetAsyncKeyState('M') & 0x8000)
+        mPostProcessStrength += postProcessAdjustmentSpeed;
+    if (mPostProcessStrength < 0.0f)
+        mPostProcessStrength = 0.0f;
+    else if (mPostProcessStrength > 1.0f)
+        mPostProcessStrength = 1.0f;
 
 	// После изменения параметров пересобираем список источников света.
 	RebuildDemoLights();
