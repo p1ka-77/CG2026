@@ -68,6 +68,7 @@ public:
     void ReleaseInitializationUpload();
 
     UINT GetParticleCount() const { return mMaxParticles; }
+    void SetMeshParticles(bool enabled) { mMeshParticles = enabled; }
 
 private:
     void BuildBuffers(
@@ -98,6 +99,13 @@ private:
     UINT mDescriptorSize = 0;
     UINT mConstantBufferStride = 0;
     bool mHasUpdated = false;
+    bool mMeshParticles = true;
+    UINT mMeshIndexCount = 0;
+    D3D12_VERTEX_BUFFER_VIEW mMeshVBView = {};
+    D3D12_INDEX_BUFFER_VIEW mMeshIBView = {};
+    ComPtr<ID3D12Resource> mMeshVB, mMeshIB;
+    ComPtr<ID3D12Resource> mMeshVBUpload, mMeshIBUpload;
+    ComPtr<ID3D12PipelineState> mMeshPSO;
 
     ComPtr<ID3D12Resource> mParticleBuffers[BufferCount];
     ComPtr<ID3D12Resource> mCounterBuffers[BufferCount];

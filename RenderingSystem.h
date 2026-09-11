@@ -65,7 +65,8 @@ struct alignas(256) LightingPassCB
 
     int ShadowsEnabled;
     int VisualizeCascades;
-    XMFLOAT2 ShadowPad;
+    float ShadowPatternEnabled;
+    float ShadowPatternScale;
 };
 
 class RenderingSystem
@@ -94,6 +95,9 @@ public:
         XMFLOAT3 strength);
 
     void ClearLights() { mLights.clear(); }
+    void BuildShadowPatternTexture(ID3D12Device* device, ID3D12GraphicsCommandList* commandList);
+    void SetShadowPattern(bool enabled, float scale)
+    { mShadowPatternEnabled = enabled; mShadowPatternScale = scale; }
 
     void BeginGeometryPass(
         ID3D12GraphicsCommandList* cmdList,
@@ -173,6 +177,7 @@ private:
     void BuildLightingSRVHeap(ID3D12Device* device);
     void BuildShadowResources(ID3D12Device* device);
     void BuildShadowSRV(ID3D12Device* device);
+    void BuildShadowPatternSRV(ID3D12Device* device);
     D3D12_GPU_DESCRIPTOR_HANDLE GetLightingSRV(UINT index) const;
 
     GBuffer mGBuffer;
@@ -186,6 +191,8 @@ private:
     ComPtr<ID3D12PipelineState> mShadowPSO;
 
     ComPtr<ID3D12Resource> mShadowMap;
+    ComPtr<ID3D12Resource> mShadowPattern;
+    ComPtr<ID3D12Resource> mShadowPatternUpload;
     ComPtr<ID3D12DescriptorHeap> mShadowDSVHeap;
     ComPtr<ID3D12DescriptorHeap> mLightingSRVHeap;
 
@@ -212,6 +219,8 @@ private:
     XMFLOAT3 mCameraForward = { 0.0f, 0.0f, 1.0f };
     bool mShadowsEnabled = true;
     bool mVisualizeCascades = false;
+    bool mShadowPatternEnabled = true;
+    float mShadowPatternScale = 2.0f;
 
     UINT mWidth = 0;
     UINT mHeight = 0;

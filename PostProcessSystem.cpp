@@ -292,7 +292,8 @@ void PostProcessSystem::Draw(
     D3D12_VIEWPORT viewport,
     D3D12_RECT scissorRect,
     UINT effectMode,
-    float strength)
+    float strength,
+    bool vignetteEnabled)
 {
     commandList->OMSetRenderTargets(1, &outputRtv, false, nullptr);
     commandList->RSSetViewports(1, &viewport);
@@ -309,6 +310,7 @@ void PostProcessSystem::Draw(
     PostProcessConstants constants;
     constants.EffectMode = effectMode;
     constants.Strength = strength;
+    constants.VignetteStrength = vignetteEnabled ? strength : 0.0f;
     if (constants.Strength < 0.0f)
         constants.Strength = 0.0f;
     else if (constants.Strength > 1.0f)

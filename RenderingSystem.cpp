@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <cstring>
 #include <string>
+#include <cmath>
 
 struct QuadVertex
 {
@@ -90,7 +91,7 @@ void RenderingSystem::Init(
 void RenderingSystem::BuildLightingSRVHeap(ID3D12Device* device)
 {
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-    heapDesc.NumDescriptors = GBUFFER_COUNT + 1;
+    heapDesc.NumDescriptors = GBUFFER_COUNT + 2;
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 
@@ -115,6 +116,78 @@ void RenderingSystem::BuildLightingSRVHeap(ID3D12Device* device)
         source.Offset(1, mSRVDescriptorSize);
         destination.Offset(1, mSRVDescriptorSize);
     }
+    if (mShadowPattern)
+        BuildShadowPatternSRV(device);
+}
+
+void RenderingSystem::BuildShadowPatternTexture(
+    ID3D12Device* device, ID3D12GraphicsCommandList* commandList)
+{
+    // A real repeatable R8 texture, generated once. No external image is required.
+    constexpr UINT size = 128, mipCount = 8;
+    std::vector<unsigned char> pixels[mipCount];
+    pixels[0].resize(size * size);
+    for (UINT y = 0; y < size; ++y)
+        for (UINT x = 0; x < size; ++x)
+        {
+            float u = (x + 0.5f) / size * 2.0f - 1.0f;
+            float v = (y + 0.5f) / size * 2.0f - 1.0f;
+            auto ellipse = [](float a, float b, float rx, float ry)
+                { return a*a/(rx*rx) + b*b/(ry*ry) < 1.0f; };
+            bool head = ellipse(u, v + 0.17f, 0.63f, 0.58f);
+            bool jaw = std::abs(u) < 0.39f && v > 0.13f && v < 0.68f;
+            bool eyes = ellipse(std::abs(u)-0.26f, v+0.08f, 0.17f, 0.19f);
+            bool nose = std::abs(u) < 0.11f && v > 0.12f && v < 0.33f;
+            bool teeth = v > 0.44f && (std::abs(u) < 0.035f || std::abs(std::abs(u)-0.21f) < 0.035f);
+            pixels[0][y*size+x] = ((head || jaw) && !eyes && !nose && !teeth) ? 255 : 0;
+        }
+    D3D12_SUBRESOURCE_DATA data[mipCount] = {};
+    for (UINT level = 0; level < mipCount; ++level)
+    {
+        UINT width = size >> level;
+        if (level > 0)
+        {
+            pixels[level].resize(width * width);
+            for (UINT y = 0; y < width; ++y)
+                for (UINT x = 0; x < width; ++x)
+                {
+                    UINT p = (y*2) * (width*2) + x*2;
+                    const auto& src = pixels[level-1];
+                    pixels[level][y*width+x] = static_cast<unsigned char>(
+                        (src[p] + src[p+1] + src[p+width*2] + src[p+width*2+1]) / 4);
+                }
+        }
+        data[level].pData = pixels[level].data();
+        data[level].RowPitch = width;
+        data[level].SlicePitch = width*width;
+    }
+    auto defaultHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+    auto uploadHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+    auto desc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R8_UNORM, size, size, 1, mipCount);
+    ThrowIfFailedLocal(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE,
+        &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&mShadowPattern)),
+        "Cannot create shadow pattern texture");
+    auto uploadDesc = CD3DX12_RESOURCE_DESC::Buffer(GetRequiredIntermediateSize(mShadowPattern.Get(), 0, mipCount));
+    ThrowIfFailedLocal(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE,
+        &uploadDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&mShadowPatternUpload)),
+        "Cannot create shadow pattern upload");
+    UpdateSubresources<mipCount>(commandList, mShadowPattern.Get(), mShadowPatternUpload.Get(), 0, 0, mipCount, data);
+    auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(mShadowPattern.Get(),
+        D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    commandList->ResourceBarrier(1, &barrier);
+    BuildShadowPatternSRV(device);
+}
+
+void RenderingSystem::BuildShadowPatternSRV(ID3D12Device* device)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC desc = {};
+    desc.Format = DXGI_FORMAT_R8_UNORM;
+    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    desc.Texture2D.MipLevels = 8;
+    auto handle = CD3DX12_CPU_DESCRIPTOR_HANDLE(mLightingSRVHeap->GetCPUDescriptorHandleForHeapStart(),
+        GBUFFER_COUNT+1, mSRVDescriptorSize);
+    device->CreateShaderResourceView(mShadowPattern.Get(), &desc, handle);
 }
 
 void RenderingSystem::BuildShadowResources(ID3D12Device* device)
@@ -386,6 +459,8 @@ void RenderingSystem::UpdateLightingCB(
         mCascadeSplits.w);
     cb.ShadowsEnabled = mShadowsEnabled ? 1 : 0;
     cb.VisualizeCascades = mVisualizeCascades ? 1 : 0;
+    cb.ShadowPatternEnabled = mShadowPatternEnabled ? 1.0f : 0.0f;
+    cb.ShadowPatternScale = mShadowPatternScale;
 
     for (int i = 0; i < cb.LightCount && i < MAX_LIGHTS; ++i)
     {
@@ -638,7 +713,7 @@ void RenderingSystem::BuildLightingRootSignature(ID3D12Device* device)
     srvRange0.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
     srvRange1.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1);
     srvRange2.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2);
-    srvRange3.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3);
+    srvRange3.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 3);
 
     CD3DX12_ROOT_PARAMETER rootParameters[5];
 
@@ -664,7 +739,7 @@ void RenderingSystem::BuildLightingRootSignature(ID3D12Device* device)
         &srvRange3,
         D3D12_SHADER_VISIBILITY_PIXEL);
 
-    CD3DX12_STATIC_SAMPLER_DESC samplers[2];
+    CD3DX12_STATIC_SAMPLER_DESC samplers[3];
     samplers[0] = CD3DX12_STATIC_SAMPLER_DESC(
         0,
         D3D12_FILTER_MIN_MAG_MIP_POINT,
@@ -683,10 +758,16 @@ void RenderingSystem::BuildLightingRootSignature(ID3D12Device* device)
         D3D12_COMPARISON_FUNC_LESS_EQUAL,
         D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE);
 
+    samplers[2] = CD3DX12_STATIC_SAMPLER_DESC(2,
+        D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        D3D12_TEXTURE_ADDRESS_MODE_WRAP);
+
     CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(
         5,
         rootParameters,
-        2,
+        3,
         samplers,
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
 

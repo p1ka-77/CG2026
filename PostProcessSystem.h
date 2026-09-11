@@ -16,7 +16,7 @@ struct PostProcessConstants
     UINT EffectMode = 1;
     float Strength = 1.0f;
     float EdgeThreshold = 0.08f;
-    float Padding0 = 0.0f;
+    float VignetteStrength = 0.0f;
 
     XMFLOAT2 InvRenderTargetSize = { 1.0f, 1.0f };
     XMFLOAT2 Padding1 = { 0.0f, 0.0f };
@@ -50,7 +50,8 @@ public:
         D3D12_VIEWPORT viewport,
         D3D12_RECT scissorRect,
         UINT effectMode,
-        float strength);
+        float strength,
+        bool vignetteEnabled);
 
     D3D12_CPU_DESCRIPTOR_HANDLE GetSceneColorRTV() const;
     bool IsInitialized() const { return mInitialized; }

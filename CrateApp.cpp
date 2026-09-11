@@ -307,8 +307,14 @@ private:
     bool mPostProcessEnabled = true;
     bool mPostProcessToggleKeyPressed = false;
     bool mPostProcessCycleKeyPressed = false;
-    UINT mPostProcessMode = 3;
+    UINT mPostProcessMode = 0;
     float mPostProcessStrength = 1.0f;
+    bool mShadowPatternEnabled = true;
+    float mShadowPatternScale = 2.0f;
+    bool mMeshParticles = true;
+    bool mVignetteEnabled = true;
+    bool mNewDemoKeysPressed[4] = {};
+    bool mDemoShadowView = false;
 	std::array<ShadowPassConstants, SHADOW_CASCADE_COUNT> mShadowPassConstants = {};
 	std::array<XMFLOAT4X4, SHADOW_CASCADE_COUNT> mShadowTransforms = {};
 	XMFLOAT4 mCascadeSplits = {};
@@ -391,6 +397,7 @@ bool CrateApp::Initialize()
 	mRenderSys.BuildGeometryRootSignature(md3dDevice.Get());
 	mRenderSys.BuildLightingRootSignature(md3dDevice.Get());
 	mRenderSys.BuildShadowRootSignature(md3dDevice.Get());
+    mRenderSys.BuildShadowPatternTexture(md3dDevice.Get(), mCommandList.Get());
 
 	//
 	// Источники света теперь создаются через demo-поля:
@@ -428,7 +435,7 @@ bool CrateApp::Initialize()
 	mParticleSystem.Initialize(
 		md3dDevice.Get(),
 		mCommandList.Get(),
-		1024,
+		128,
 		gNumFrameResources,
 		mDepthStencilFormat);
 	//
@@ -640,6 +647,7 @@ void CrateApp::Draw(const GameTimer& gt)
 		nullptr
 	);
 
+    mRenderSys.SetShadowPattern(mShadowPatternEnabled, mShadowPatternScale);
     D3D12_CPU_DESCRIPTOR_HANDLE lightingTarget = CurrentBackBufferView();
     if (mPostProcessEnabled)
     {
@@ -666,7 +674,8 @@ void CrateApp::Draw(const GameTimer& gt)
             mScreenViewport,
             mScissorRect,
             mPostProcessMode,
-            mPostProcessStrength);
+            mPostProcessStrength,
+            mVignetteEnabled);
     }
 
 
@@ -1202,13 +1211,17 @@ void CrateApp::UpdateVisibleObjects()
 
 void CrateApp::AppendPostProcessStatus(std::wstring& title) const
 {
+    // Put the new controls FIRST so they remain visible in a narrow title bar.
+    title = std::wstring(mShadowPatternEnabled ? L"Skulls ON" : L"Skulls OFF") + L" [F3, [/]] | "
+        + (mMeshParticles ? L"Teapots" : L"Spheres") + L" [F4] | Vignette "
+        + (mVignetteEnabled && mPostProcessEnabled ? L"ON" : L"OFF") + L" [F5] | Views [F6] | " + title;
     if (!mPostProcessEnabled)
     {
         title += L" | PostFX: OFF [5]";
         return;
     }
 
-    const wchar_t* modeName = L"GRAYSCALE";
+    const wchar_t* modeName = mPostProcessMode == 0 ? L"COLOR" : L"GRAYSCALE";
     if (mPostProcessMode == 2)
         modeName = L"OUTLINES";
     else if (mPostProcessMode == 3)
@@ -1430,13 +1443,51 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
     }
     mPostProcessToggleKeyPressed = key5Down;
 
-    // B - cycle: grayscale -> GBuffer outlines -> both effects.
+    // B - cycle: color -> grayscale -> GBuffer outlines -> both effects.
     bool keyBDown = (GetAsyncKeyState('B') & 0x8000) != 0;
     if (keyBDown && !mPostProcessCycleKeyPressed)
     {
-        mPostProcessMode = mPostProcessMode % 3 + 1;
+        mPostProcessMode = (mPostProcessMode + 1) % 4;
     }
     mPostProcessCycleKeyPressed = keyBDown;
+
+    const int demoKeys[4] = { VK_F3, VK_F4, VK_F5, VK_F6 };
+    for (int k = 0; k < 4; ++k)
+    {
+        bool down = (GetAsyncKeyState(demoKeys[k]) & 0x8000) != 0;
+        if (down && !mNewDemoKeysPressed[k])
+        {
+            if (k == 0)
+            {
+                mShadowPatternEnabled = !mShadowPatternEnabled;
+                if (mShadowPatternEnabled) { mShadowsEnabled = true; mVisualizeShadowCascades = false; }
+            }
+            if (k == 1) { mMeshParticles = !mMeshParticles; mParticlesEnabled = true; }
+            if (k == 2)
+            {
+                mVignetteEnabled = !mPostProcessEnabled || !mVignetteEnabled;
+                if (mVignetteEnabled) mPostProcessEnabled = true;
+            }
+            if (k == 3)
+            {
+                // First press: close fountain view. Second: boxes and patterned shadows.
+                mCameraPos = mDemoShadowView ? XMFLOAT3(5.5f, 5.0f, -10.0f) : XMFLOAT3(0.0f, 3.4f, -11.0f);
+                mYaw = mDemoShadowView ? -0.45f : 0.0f;
+                mPitch = mDemoShadowView ? -0.48f : -0.18f;
+                mDemoShadowView = !mDemoShadowView;
+                mParticlesEnabled = true;
+                mShadowsEnabled = true;
+                mVisualizeShadowCascades = false;
+                mPostProcessMode = 0;
+                mPostProcessStrength = 1.0f;
+            }
+        }
+        mNewDemoKeysPressed[k] = down;
+    }
+    mParticleSystem.SetMeshParticles(mMeshParticles);
+    if (GetAsyncKeyState(VK_OEM_4) & 0x8000) mShadowPatternScale -= gt.DeltaTime();
+    if (GetAsyncKeyState(VK_OEM_6) & 0x8000) mShadowPatternScale += gt.DeltaTime();
+    mShadowPatternScale = MathHelper::Clamp(mShadowPatternScale, 0.5f, 8.0f);
 
     // N/M - smoothly decrease/increase the effect strength.
     const float postProcessAdjustmentSpeed = 0.8f * gt.DeltaTime();

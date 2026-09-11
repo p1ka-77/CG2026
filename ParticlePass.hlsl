@@ -1,6 +1,6 @@
 // GPU particle system:
 // CS consumes every particle from one StructuredBuffer and appends the
-// updated particle to the second buffer. VS/GS/PS render opaque billboards.
+// updated particle to the second buffer. Rendering supports billboards and meshes.
 
 struct Particle
 {
@@ -64,7 +64,7 @@ void RespawnParticle(inout Particle particle, uint dispatchIndex)
     float radialSpeed = lerp(0.3f, 1.35f, Random01(randomState));
     float verticalSpeed = lerp(2.8f, 4.8f, Random01(randomState));
     float colorChoice = Random01(randomState);
-    float size = lerp(0.09f, 0.17f, Random01(randomState));
+    float size = lerp(0.32f, 0.48f, Random01(randomState));
 
     particle.Position = gEmitterPositionW;
     particle.Velocity = float3(
@@ -98,7 +98,7 @@ void CS(uint3 dispatchThreadId : SV_DispatchThreadID)
     particle.Velocity.y -= 2.8f * gDeltaTime;
     particle.Position += particle.Velocity * gDeltaTime;
 
-    if (particle.Age >= particle.Lifetime || particle.Position.y < 0.16f)
+    if (particle.Age >= particle.Lifetime || particle.Position.y < 0.15f + particle.Size.y * 0.31f)
     {
         RespawnParticle(particle, dispatchThreadId.x);
     }
@@ -121,6 +121,40 @@ ParticleVertex VS(uint vertexId : SV_VertexID)
     output.CenterW = particle.Position;
     output.Color = particle.Color;
     output.Size = particle.Size;
+    return output;
+}
+
+// The mesh path reads the same compute-updated particle buffer by instance ID.
+struct MeshVertexIn
+{
+    float3 PosL : POSITION;
+    float3 NormalL : NORMAL;
+};
+
+struct MeshVertexOut
+{
+    float4 PosH : SV_POSITION;
+    float3 PosW : POSITION;
+    float3 NormalW : NORMAL;
+    float4 Color : COLOR;
+};
+
+float3 RotateParticle(float3 v, float angle)
+{
+    float s, c;
+    sincos(angle, s, c);
+    return float3(c * v.x + s * v.z, v.y, -s * v.x + c * v.z);
+}
+
+MeshVertexOut MeshVS(MeshVertexIn input, uint instanceId : SV_InstanceID)
+{
+    Particle particle = gParticles[instanceId];
+    float angle = particle.Age * 1.6f + (particle.Seed & 255u) * 0.02454f;
+    MeshVertexOut output;
+    output.PosW = RotateParticle(input.PosL * particle.Size.x, angle) + particle.Position;
+    output.NormalW = RotateParticle(input.NormalL, angle);
+    output.PosH = mul(float4(output.PosW, 1.0f), gViewProj);
+    output.Color = particle.Color;
     return output;
 }
 
@@ -201,5 +235,14 @@ GBufferOutput PS(BillboardVertex input)
     output.Albedo = float4(
         input.Color.rgb * (0.65f + 0.35f * sphereDepth),
         0.65f);
+    return output;
+}
+
+GBufferOutput MeshPS(MeshVertexOut input)
+{
+    GBufferOutput output;
+    output.Position = float4(input.PosW, 1.0f);
+    output.Normal = float4(normalize(input.NormalW) * 0.5f + 0.5f, 1.0f);
+    output.Albedo = float4(input.Color.rgb, 0.35f);
     return output;
 }

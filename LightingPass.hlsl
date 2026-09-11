@@ -6,9 +6,11 @@ Texture2D gPosition : register(t0);
 Texture2D gNormal : register(t1);
 Texture2D gAlbedo : register(t2);
 Texture2DArray<float> gShadowMap : register(t3);
+Texture2D<float> gShadowPattern : register(t4);
 
 SamplerState gsamPoint : register(s0);
 SamplerComparisonState gsamShadow : register(s1);
+SamplerState gsamPatternWrap : register(s2);
 
 #define LIGHT_DIRECTIONAL 0
 #define LIGHT_POINT       1
@@ -49,7 +51,8 @@ cbuffer cbLighting : register(b0)
 
     int gShadowsEnabled;
     int gVisualizeCascades;
-    float2 gShadowPad;
+    float gShadowPatternEnabled;
+    float gShadowPatternScale;
 };
 
 struct VertexIn
@@ -248,6 +251,19 @@ float4 PS(VertexOut pin) : SV_Target
         }
 
         result += contribution;
+    }
+
+    if (gShadowPatternEnabled > 0.5f && gShadowsEnabled != 0)
+    {
+        // Dominant-axis world projection: stable on floors AND vertical surfaces.
+        float3 axis = abs(N);
+        float2 patternUV = posW.xz;
+        if (axis.x > axis.y && axis.x > axis.z) patternUV = posW.zy;
+        else if (axis.z > axis.y) patternUV = posW.xy;
+        float motif = gShadowPattern.Sample(gsamPatternWrap, patternUV * gShadowPatternScale);
+        // Beyond the CSM coverage shadowFactor is 1, so no pattern leaks there.
+        float mask = (1.0f - shadowFactor) * motif;
+        result = lerp(result, float3(0.58f, 0.42f, 0.16f), mask * 0.9f);
     }
 
     if (gVisualizeCascades != 0 &&

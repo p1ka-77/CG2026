@@ -11,7 +11,7 @@ cbuffer cbPostProcess : register(b0)
     uint gEffectMode;
     float gStrength;
     float gEdgeThreshold;
-    float gPadding0;
+    float gVignetteStrength;
 
     float2 gInvRenderTargetSize;
     float2 gPadding1;
@@ -130,5 +130,10 @@ float4 PS(VertexOut input) : SV_Target
         color = lerp(color, outlineColor, saturate(edge * gStrength));
     }
 
+    // Circular in pixel space, including wide windows. Applied in this same PS.
+    float2 centered = (input.TexC - 0.5f) * 2.0f;
+    centered.x *= gInvRenderTargetSize.y / gInvRenderTargetSize.x;
+    float vignette = smoothstep(0.48f, 1.12f, length(centered));
+    color *= 1.0f - vignette * saturate(gVignetteStrength);
     return float4(color, 1.0f);
 }

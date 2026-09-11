@@ -1,6 +1,7 @@
 #include "ParticleSystem.h"
 
 #include "GBuffer.h"
+#include "ObjLoader.h"
 #include "../../Common/d3dUtil.h"
 
 #include <algorithm>
@@ -79,6 +80,21 @@ void ParticleSystem::Initialize(
     BuildDescriptorHeap(device);
     BuildConstantBuffer(device);
     BuildPipelineStates(device, depthFormat);
+
+    // Teapot extracted from breakfast_room.obj, centered and normalized.
+    const auto mesh = ObjLoader::Load("Models/particle_teapot.obj");
+    std::vector<uint32_t> indices;
+    for (const auto& part : mesh.SubMeshes)
+        indices.insert(indices.end(), part.Indices.begin(), part.Indices.end());
+    mMeshIndexCount = static_cast<UINT>(indices.size());
+    const UINT vbSize = static_cast<UINT>(mesh.Vertices.size() * sizeof(ObjVertex));
+    const UINT ibSize = mMeshIndexCount * sizeof(uint32_t);
+    mMeshVB = d3dUtil::CreateDefaultBuffer(device, commandList,
+        mesh.Vertices.data(), vbSize, mMeshVBUpload);
+    mMeshIB = d3dUtil::CreateDefaultBuffer(device, commandList,
+        indices.data(), ibSize, mMeshIBUpload);
+    mMeshVBView = { mMeshVB->GetGPUVirtualAddress(), vbSize, sizeof(ObjVertex) };
+    mMeshIBView = { mMeshIB->GetGPUVirtualAddress(), ibSize, DXGI_FORMAT_R32_UINT };
 }
 
 void ParticleSystem::BuildBuffers(
@@ -134,7 +150,7 @@ void ParticleSystem::BuildBuffers(
     ThrowIfFailedParticle(hr, "ParticleSystem failed to create particle upload buffer");
 
     std::vector<ParticleGPU> initialParticles(mMaxParticles);
-    const XMFLOAT3 emitter = { 0.0f, 0.25f, 0.0f };
+    const XMFLOAT3 emitter = { 0.0f, 1.6f, -6.0f };
     constexpr float goldenAngle = 2.39996323f;
     constexpr float gravity = 2.8f;
 
@@ -175,7 +191,7 @@ void ParticleSystem::BuildBuffers(
             0.45f + 0.45f * (1.0f - variation),
             1.0f - 0.65f * variation,
             1.0f);
-        float size = 0.09f + 0.08f * variation;
+        float size = 0.32f + 0.16f * variation;
         particle.Size = XMFLOAT2(size, size);
         particle.Seed = i * 747796405u + 2891336453u;
 
@@ -478,6 +494,20 @@ void ParticleSystem::BuildPipelineStates(
         &renderDesc,
         IID_PPV_ARGS(&mRenderPSO));
     ThrowIfFailedParticle(hr, "ParticleSystem failed to create render PSO");
+
+    auto meshVS = d3dUtil::CompileShader(L"Shaders\\ParticlePass.hlsl", nullptr, "MeshVS", "vs_5_0");
+    auto meshPS = d3dUtil::CompileShader(L"Shaders\\ParticlePass.hlsl", nullptr, "MeshPS", "ps_5_0");
+    const D3D12_INPUT_ELEMENT_DESC meshLayout[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
+    };
+    renderDesc.InputLayout = { meshLayout, _countof(meshLayout) };
+    renderDesc.VS = { meshVS->GetBufferPointer(), meshVS->GetBufferSize() };
+    renderDesc.GS = { nullptr, 0 };
+    renderDesc.PS = { meshPS->GetBufferPointer(), meshPS->GetBufferSize() };
+    renderDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    hr = device->CreateGraphicsPipelineState(&renderDesc, IID_PPV_ARGS(&mMeshPSO));
+    ThrowIfFailedParticle(hr, "ParticleSystem failed to create teapot mesh PSO");
 }
 
 void ParticleSystem::Update(
@@ -525,7 +555,7 @@ void ParticleSystem::Update(
     constants.DeltaTime = (std::min)(deltaTime, 1.0f / 20.0f);
     constants.TotalTime = totalTime;
     constants.ParticleCount = mMaxParticles;
-    constants.EmitterPositionW = XMFLOAT3(0.0f, 0.25f, 0.0f);
+    constants.EmitterPositionW = XMFLOAT3(0.0f, 1.6f, -6.0f);
     constants.FrameIndex = mFrameSequence++;
 
     XMMATRIX inverseView = XMMatrixInverse(nullptr, view);
@@ -598,7 +628,7 @@ void ParticleSystem::Draw(ID3D12GraphicsCommandList* commandList)
 
     ID3D12DescriptorHeap* heaps[] = { mParticleDescriptorHeap.Get() };
     commandList->SetDescriptorHeaps(_countof(heaps), heaps);
-    commandList->SetPipelineState(mRenderPSO.Get());
+    commandList->SetPipelineState(mMeshParticles ? mMeshPSO.Get() : mRenderPSO.Get());
     commandList->SetGraphicsRootSignature(mRenderRootSignature.Get());
     commandList->SetGraphicsRootDescriptorTable(
         0,
@@ -606,6 +636,15 @@ void ParticleSystem::Draw(ID3D12GraphicsCommandList* commandList)
     commandList->SetGraphicsRootConstantBufferView(
         1,
         mCurrentConstantBufferAddress);
+
+    if (mMeshParticles)
+    {
+        commandList->IASetVertexBuffers(0, 1, &mMeshVBView);
+        commandList->IASetIndexBuffer(&mMeshIBView);
+        commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        commandList->DrawIndexedInstanced(mMeshIndexCount, mMaxParticles, 0, 0, 0);
+        return;
+    }
 
     commandList->IASetVertexBuffers(0, 0, nullptr);
     commandList->IASetIndexBuffer(nullptr);
@@ -617,6 +656,8 @@ void ParticleSystem::Draw(ID3D12GraphicsCommandList* commandList)
 void ParticleSystem::ReleaseInitializationUpload()
 {
     mParticleInitializationUpload.Reset();
+    mMeshVBUpload.Reset();
+    mMeshIBUpload.Reset();
 }
 
 D3D12_GPU_DESCRIPTOR_HANDLE ParticleSystem::GetGpuDescriptor(
