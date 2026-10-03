@@ -13,8 +13,10 @@
 #include "RenderingSystem.h"
 #include "ParticleSystem.h"
 #include "PostProcessSystem.h"
+#include "TerrainSystem.h"
 #include <cfloat>
 #include <algorithm>
+#include <fstream>
 #include <DirectXCollision.h>
 
 using Microsoft::WRL::ComPtr;
@@ -229,6 +231,13 @@ private:
 	ParticleSystem mParticleSystem;
 
     PostProcessSystem mPostProcessSystem;
+    TerrainSystem mTerrain;
+    bool mTerrainMode = true;
+    int mTerrainCapture = -1; // Optional automated GPU readback check, never used during normal play.
+    bool mTerrainKeys[7] = {};
+    unsigned mTerrainCameraPreset = 0;
+    XMFLOAT3 mOtherCameraPos = { 0.0f, 2.0f, -8.0f };
+    float mOtherYaw = 0.0f, mOtherPitch = 0.0f;
 	ComPtr<ID3D12Resource> mUVAnimCBUpload;
 	UVAnimCB* mUVAnimCBMapped = nullptr;
 	XMFLOAT4X4 mView = MathHelper::Identity4x4();
@@ -346,11 +355,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance,
         MessageBox(nullptr, e.ToString().c_str(), L"HR Failed", MB_OK);
         return 0;
     }
+    catch(const std::exception& e)
+    {
+        MessageBoxA(nullptr, e.what(), "Crate initialization error", MB_OK | MB_ICONERROR);
+        return 1;
+    }
 }
 
 CrateApp::CrateApp(HINSTANCE hInstance)
     : D3DApp(hInstance)
 {
+    mCameraPos = XMFLOAT3(0.0f, 450.0f, -1500.0f);
+    mYaw = 0.0f;
+    mPitch = -0.2f;
 }
 
 CrateApp::~CrateApp()
@@ -432,6 +449,8 @@ bool CrateApp::Initialize()
         mBackBufferFormat,
         mRenderSys.GetGBuffer().GetSRVHeap());
 
+    mTerrain.Initialize(md3dDevice.Get(), mCommandList.Get(), mDepthStencilFormat);
+
 	mParticleSystem.Initialize(
 		md3dDevice.Get(),
 		mCommandList.Get(),
@@ -456,6 +475,25 @@ bool CrateApp::Initialize()
 
 	mTexMgr.ReleaseUploadHeaps();
 	mParticleSystem.ReleaseInitializationUpload();
+    mTerrain.ReleaseUploadBuffers();
+    if (const char* capture = strstr(GetCommandLineA(), "--terrain-capture="))
+    {
+        mTerrainCapture = atoi(capture + strlen("--terrain-capture="));
+        mTerrain.DebugMode = mTerrainCapture == 1 ? 1 : mTerrainCapture == 2 ? 2 : 0;
+        if (mTerrainCapture == 3)
+        {
+            mTerrainMode = false;
+            mCameraPos = mOtherCameraPos; mYaw = mOtherYaw; mPitch = mOtherPitch;
+            XMStoreFloat4x4(&mProj,XMMatrixPerspectiveFovLH(0.25f*MathHelper::Pi,AspectRatio(),1,1000));
+        }
+        if (mTerrainCapture == 4) {mTerrain.EnableLOD=false; mTerrain.DebugMode=1;}
+        if (mTerrainCapture == 5) {mCameraPos=XMFLOAT3(0,1500,-2600); mPitch=-0.48f; mTerrain.DebugMode=1;}
+    }
+    if (strstr(GetCommandLineA(), "--terrain-test") != nullptr)
+    {
+        mTerrain.RunSelectionChecks();
+        return false;
+    }
 
 	return true;
 }
@@ -467,8 +505,8 @@ void CrateApp::OnResize()
 	XMMATRIX P = XMMatrixPerspectiveFovLH(
 		0.25f * MathHelper::Pi,
 		AspectRatio(),
-		1.0f,
-		1000.0f);
+		mTerrainMode ? 0.5f : 1.0f,
+		mTerrainMode ? 12000.0f : 1000.0f);
 
 	XMStoreFloat4x4(&mProj, P);
 
@@ -512,6 +550,16 @@ void CrateApp::Update(const GameTimer& gt)
         CloseHandle(eventHandle);
     }
 
+    if (mTerrainMode)
+    {
+        mTerrain.Select(XMLoadFloat4x4(&mView), XMLoadFloat4x4(&mProj), static_cast<float>(mClientHeight));
+        mRenderSys.ClearLights();
+        mRenderSys.AddDirectionalLight(XMFLOAT3(0.4f,-0.8f,0.35f),XMFLOAT3(2.8f,2.65f,2.4f));
+        mRenderSys.SetShadowData(mShadowTransforms,mCascadeSplits,XMFLOAT3(0,0,1),false,false);
+        SetWindowText(mhMainWnd,mTerrain.Status().c_str());
+        return;
+    }
+
 	AnimateMaterials(gt);
 	UpdateSinusoidalAnimations(gt);
 	UpdateObjectCBs(gt);
@@ -532,7 +580,7 @@ void CrateApp::Draw(const GameTimer& gt)
 	// PSO можно передать nullptr, потому что нужные PSO выставит RenderingSystem.
 	ThrowIfFailed(mCommandList->Reset(cmdListAlloc.Get(), nullptr));
 
-	if (mParticlesEnabled)
+	if (mParticlesEnabled && !mTerrainMode)
 	{
 		mParticleSystem.Update(
 			mCommandList.Get(),
@@ -548,7 +596,7 @@ void CrateApp::Draw(const GameTimer& gt)
 	// 0. CASCADED SHADOW PASS
 	// Каждый срез Texture2DArray получает depth направленного света.
 	//
-	if (mShadowsEnabled)
+	if (mShadowsEnabled && !mTerrainMode)
 	{
 		mRenderSys.BeginShadowPass(mCommandList.Get());
 
@@ -591,6 +639,12 @@ void CrateApp::Draw(const GameTimer& gt)
 		nullptr
 	);
 
+    if (mTerrainMode)
+    {
+        mTerrain.Draw(mCommandList.Get(),XMLoadFloat4x4(&mView)*XMLoadFloat4x4(&mProj));
+    }
+    else
+    {
 	// Для GeometryPass.hlsl нужна куча с обычными текстурами сцены.
 	ID3D12DescriptorHeap* descriptorHeaps[] = { mSrvDescriptorHeap.Get() };
 	mCommandList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
@@ -621,6 +675,7 @@ void CrateApp::Draw(const GameTimer& gt)
 		mParticleSystem.Draw(mCommandList.Get());
 	}
 
+    }
 	// Переводим GBuffer из RENDER_TARGET в PIXEL_SHADER_RESOURCE.
 	mRenderSys.EndGeometryPass(mCommandList.Get());
 
@@ -647,9 +702,9 @@ void CrateApp::Draw(const GameTimer& gt)
 		nullptr
 	);
 
-    mRenderSys.SetShadowPattern(mShadowPatternEnabled, mShadowPatternScale);
+    mRenderSys.SetShadowPattern(mShadowPatternEnabled && !mTerrainMode, mShadowPatternScale);
     D3D12_CPU_DESCRIPTOR_HANDLE lightingTarget = CurrentBackBufferView();
-    if (mPostProcessEnabled)
+    if (mPostProcessEnabled && !mTerrainMode)
     {
         // Lighting first writes the fully lit frame into an off-screen texture.
         mPostProcessSystem.BeginSceneColorPass(mCommandList.Get());
@@ -662,10 +717,10 @@ void CrateApp::Draw(const GameTimer& gt)
 		mScreenViewport,
 		mScissorRect,
 		mEyePos,
-		XMFLOAT4(0.05f, 0.05f, 0.05f, 1.0f)
+		mTerrainMode ? XMFLOAT4(0.28f,0.32f,0.38f,1.0f) : XMFLOAT4(0.05f, 0.05f, 0.05f, 1.0f)
 	);
 
-    if (mPostProcessEnabled)
+    if (mPostProcessEnabled && !mTerrainMode)
     {
         mPostProcessSystem.EndSceneColorPass(mCommandList.Get());
         mPostProcessSystem.Draw(
@@ -679,6 +734,28 @@ void CrateApp::Draw(const GameTimer& gt)
     }
 
 
+    ComPtr<ID3D12Resource> captureReadback;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT captureLayout = {};
+    UINT64 captureSize = 0;
+    if (mTerrainCapture >= 0)
+    {
+        auto desc = CurrentBackBuffer()->GetDesc();
+        if (desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM)
+            throw std::runtime_error("Frame capture expects an RGBA8 back buffer");
+        md3dDevice->GetCopyableFootprints(&desc,0,1,0,&captureLayout,nullptr,nullptr,&captureSize);
+        auto heap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
+        auto buffer = CD3DX12_RESOURCE_DESC::Buffer(captureSize);
+        ThrowIfFailed(md3dDevice->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&captureReadback)));
+        auto toCopy=CD3DX12_RESOURCE_BARRIER::Transition(CurrentBackBuffer(),
+            D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        mCommandList->ResourceBarrier(1,&toCopy);
+        CD3DX12_TEXTURE_COPY_LOCATION dst(captureReadback.Get(),captureLayout),src(CurrentBackBuffer(),0);
+        mCommandList->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+        auto toRender=CD3DX12_RESOURCE_BARRIER::Transition(CurrentBackBuffer(),
+            D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_RENDER_TARGET);
+        mCommandList->ResourceBarrier(1,&toRender);
+    }
 	auto barrierToPresent = CD3DX12_RESOURCE_BARRIER::Transition(
 		CurrentBackBuffer(),
 		D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -697,6 +774,22 @@ void CrateApp::Draw(const GameTimer& gt)
 
 	ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
 	mCommandQueue->ExecuteCommandLists(_countof(cmdsLists), cmdsLists);
+
+	if (captureReadback)
+    {
+        FlushCommandQueue(); // Only the optional test path stalls for CPU readback.
+        unsigned char* pixels = nullptr;
+        D3D12_RANGE readRange={0,static_cast<SIZE_T>(captureSize)};
+        ThrowIfFailed(captureReadback->Map(0,&readRange,reinterpret_cast<void**>(&pixels)));
+        std::ofstream output("terrain_capture_"+std::to_string(mTerrainCapture)+".ppm",std::ios::binary);
+        output<<"P6\n"<<mClientWidth<<" "<<mClientHeight<<"\n255\n";
+        for(int y=0;y<mClientHeight;++y) for(int x=0;x<mClientWidth;++x)
+            output.write(reinterpret_cast<const char*>(pixels+captureLayout.Offset+y*captureLayout.Footprint.RowPitch+x*4),3);
+        D3D12_RANGE noWrite={0,0}; captureReadback->Unmap(0,&noWrite);
+        if(!output) throw std::runtime_error("Cannot write frame capture");
+        mTerrainCapture=-1;
+        PostQuitMessage(0);
+    }
 
 	ThrowIfFailed(mSwapChain->Present(0, 0));
 	mCurrBackBuffer = (mCurrBackBuffer + 1) % SwapChainBufferCount;
@@ -1237,6 +1330,18 @@ void CrateApp::AppendPostProcessStatus(std::wstring& title) const
 
 void CrateApp::OnKeyboardInput(const GameTimer& gt)
 {
+    bool terrainToggle = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+    if (terrainToggle && !mTerrainKeys[0])
+    {
+        mTerrainMode = !mTerrainMode;
+        std::swap(mCameraPos,mOtherCameraPos);
+        std::swap(mYaw,mOtherYaw);
+        std::swap(mPitch,mOtherPitch);
+        mTerrain.FreezeSelection = false;
+        XMStoreFloat4x4(&mProj,XMMatrixPerspectiveFovLH(0.25f*MathHelper::Pi,AspectRatio(),
+            mTerrainMode?0.5f:1.0f,mTerrainMode?12000.0f:1000.0f));
+    }
+    mTerrainKeys[0] = terrainToggle;
 	const float moveSpeed = 4.0f * gt.DeltaTime();
 	const float rangeSpeed = 10.0f * gt.DeltaTime();
 
@@ -1275,7 +1380,7 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 
 	float dt = gt.DeltaTime();
 
-	float cameraMoveSpeed = mCameraMoveSpeed * dt;
+	float cameraMoveSpeed = (mTerrainMode ? 180.0f : mCameraMoveSpeed) * dt;
 
 	if (GetAsyncKeyState(VK_SHIFT) & 0x8000)
 		cameraMoveSpeed *= 3.0f;
@@ -1301,24 +1406,53 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 	XMVECTOR pos = XMLoadFloat3(&mCameraPos);
 
 	if (GetAsyncKeyState('W') & 0x8000)
-		pos = XMVectorAdd(pos, XMVectorScale(forward, moveSpeed));
+		pos = XMVectorAdd(pos, XMVectorScale(forward, cameraMoveSpeed));
 
 	if (GetAsyncKeyState('S') & 0x8000)
-		pos = XMVectorSubtract(pos, XMVectorScale(forward, moveSpeed));
+		pos = XMVectorSubtract(pos, XMVectorScale(forward, cameraMoveSpeed));
 
 	if (GetAsyncKeyState('D') & 0x8000)
-		pos = XMVectorAdd(pos, XMVectorScale(right, moveSpeed));
+		pos = XMVectorAdd(pos, XMVectorScale(right, cameraMoveSpeed));
 
 	if (GetAsyncKeyState('A') & 0x8000)
-		pos = XMVectorSubtract(pos, XMVectorScale(right, moveSpeed));
+		pos = XMVectorSubtract(pos, XMVectorScale(right, cameraMoveSpeed));
 
 	if (GetAsyncKeyState('E') & 0x8000)
-		pos = XMVectorAdd(pos, XMVectorScale(worldUp, moveSpeed));
+		pos = XMVectorAdd(pos, XMVectorScale(worldUp, cameraMoveSpeed));
 
 	if (GetAsyncKeyState('Q') & 0x8000)
-		pos = XMVectorSubtract(pos, XMVectorScale(worldUp, moveSpeed));
+		pos = XMVectorSubtract(pos, XMVectorScale(worldUp, cameraMoveSpeed));
 
 	XMStoreFloat3(&mCameraPos, pos);
+
+    if (mTerrainMode)
+    {
+        const int keys[] = {VK_F8,VK_F9,VK_F10,VK_F11,VK_F12,'L'};
+        for(unsigned k=0;k<6;++k)
+        {
+            bool down=(GetAsyncKeyState(keys[k])&0x8000)!=0;
+            if(down && !mTerrainKeys[k+1])
+            {
+                if(k==0) {mTerrain.EnableLOD=!mTerrain.EnableLOD; mTerrain.FreezeSelection=false;}
+                if(k==1) {mTerrain.EnableCulling=!mTerrain.EnableCulling; mTerrain.FreezeSelection=false;}
+                if(k==2) mTerrain.DebugMode=(mTerrain.DebugMode+1)%3;
+                if(k==3)
+                {
+                    mTerrainCameraPreset=(mTerrainCameraPreset+1)%3;
+                    const XMFLOAT3 cameras[]={XMFLOAT3(0,450,-1500),XMFLOAT3(-250,240,-700),XMFLOAT3(0,1500,-2600)};
+                    const float pitches[]={-0.2f,-0.12f,-0.48f};
+                    mCameraPos=cameras[mTerrainCameraPreset]; mYaw=0; mPitch=pitches[mTerrainCameraPreset];
+                }
+                if(k==4) mTerrain.FreezeSelection=!mTerrain.FreezeSelection;
+                if(k==5) mTerrain.EnableSkirts=!mTerrain.EnableSkirts;
+            }
+            mTerrainKeys[k+1]=down;
+        }
+        if(GetAsyncKeyState(VK_OEM_MINUS)&0x8000) {mTerrain.PixelError-=10*dt; mTerrain.FreezeSelection=false;}
+        if(GetAsyncKeyState(VK_OEM_PLUS)&0x8000) {mTerrain.PixelError+=10*dt; mTerrain.FreezeSelection=false;}
+        mTerrain.PixelError=MathHelper::Clamp(mTerrain.PixelError,1.0f,80.0f);
+        return;
+    }
 
 	if (selectedStrength != nullptr)
 	{
