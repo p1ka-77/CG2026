@@ -25,6 +25,7 @@ using namespace DirectX::PackedVector;
 
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "D3D12.lib")
+#pragma comment(lib, "ole32.lib")
 
 const int gNumFrameResources = 3;
 
@@ -235,6 +236,7 @@ private:
     bool mTerrainMode = true;
     int mTerrainCapture = -1; // Optional automated GPU readback check, never used during normal play.
     bool mTerrainKeys[7] = {};
+    bool mTerrainPaintKeys[6] = {};
     unsigned mTerrainCameraPreset = 0;
     XMFLOAT3 mOtherCameraPos = { 0.0f, 2.0f, -8.0f };
     float mOtherYaw = 0.0f, mOtherPitch = 0.0f;
@@ -344,6 +346,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance,
 
     try
     {
+        // WIC/DirectXTex needs COM initialized explicitly on the loading thread.
+        ThrowIfFailed(CoInitializeEx(nullptr,COINIT_MULTITHREADED));
+        struct ComScope { ~ComScope() {CoUninitialize();} } comScope;
         CrateApp theApp(hInstance);
         if(!theApp.Initialize())
             return 0;
@@ -352,12 +357,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance,
     }
     catch(DxException& e)
     {
-        MessageBox(nullptr, e.ToString().c_str(), L"HR Failed", MB_OK);
-        return 0;
+        std::ofstream log("crate_error.txt");
+        auto details=e.ToString();
+        int bytes=WideCharToMultiByte(CP_UTF8,0,details.data(),static_cast<int>(details.size()),nullptr,0,nullptr,nullptr);
+        std::string utf8(bytes,'\0');
+        WideCharToMultiByte(CP_UTF8,0,details.data(),static_cast<int>(details.size()),&utf8[0],bytes,nullptr,nullptr);
+        log<<"HRESULT: "<<std::hex<<e.ErrorCode<<"\n"<<utf8<<"\n";
+        if(strstr(GetCommandLineA(),"--terrain-")==nullptr)
+            MessageBox(nullptr, e.ToString().c_str(), L"HR Failed", MB_OK);
+        return 1;
     }
     catch(const std::exception& e)
     {
-        MessageBoxA(nullptr, e.what(), "Crate initialization error", MB_OK | MB_ICONERROR);
+        std::ofstream("crate_error.txt")<<e.what()<<"\n";
+        if(strstr(GetCommandLineA(),"--terrain-")==nullptr)
+            MessageBoxA(nullptr, e.what(), "Crate initialization error", MB_OK | MB_ICONERROR);
         return 1;
     }
 }
@@ -365,9 +379,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance,
 CrateApp::CrateApp(HINSTANCE hInstance)
     : D3DApp(hInstance)
 {
-    mCameraPos = XMFLOAT3(0.0f, 450.0f, -1500.0f);
-    mYaw = 0.0f;
-    mPitch = -0.2f;
+    // The original lab remains at the world origin, inside the terrain clearing.
+    mCameraPos = XMFLOAT3(3.0f, 3.0f, 8.0f);
+    mYaw = XM_PI;
+    mPitch = -0.15f;
 }
 
 CrateApp::~CrateApp()
@@ -449,7 +464,7 @@ bool CrateApp::Initialize()
         mBackBufferFormat,
         mRenderSys.GetGBuffer().GetSRVHeap());
 
-    mTerrain.Initialize(md3dDevice.Get(), mCommandList.Get(), mDepthStencilFormat);
+    mTerrain.Initialize(md3dDevice.Get(), mCommandList.Get(), mDepthStencilFormat, gNumFrameResources);
 
 	mParticleSystem.Initialize(
 		md3dDevice.Get(),
@@ -480,6 +495,11 @@ bool CrateApp::Initialize()
     {
         mTerrainCapture = atoi(capture + strlen("--terrain-capture="));
         mTerrain.DebugMode = mTerrainCapture == 1 ? 1 : mTerrainCapture == 2 ? 2 : 0;
+        if (mTerrainCapture <= 2 || mTerrainCapture == 4)
+        { mCameraPos=XMFLOAT3(0,450,-1500); mYaw=0; mPitch=-0.2f; }
+        // 10: normal starting view; 11: room and surrounding terrain together.
+        if (mTerrainCapture == 11)
+        { mCameraPos=XMFLOAT3(0,18,-38); mYaw=0; mPitch=-0.32f; }
         if (mTerrainCapture == 3)
         {
             mTerrainMode = false;
@@ -487,7 +507,20 @@ bool CrateApp::Initialize()
             XMStoreFloat4x4(&mProj,XMMatrixPerspectiveFovLH(0.25f*MathHelper::Pi,AspectRatio(),1,1000));
         }
         if (mTerrainCapture == 4) {mTerrain.EnableLOD=false; mTerrain.DebugMode=1;}
-        if (mTerrainCapture == 5) {mCameraPos=XMFLOAT3(0,1500,-2600); mPitch=-0.48f; mTerrain.DebugMode=1;}
+        if (mTerrainCapture == 5) {mCameraPos=XMFLOAT3(0,1500,-2600); mYaw=0; mPitch=-0.48f; mTerrain.DebugMode=1;}
+        if (mTerrainCapture >= 6 && mTerrainCapture <= 9)
+        {
+            mTerrain.MakePaintDemo();
+            mCameraPos=XMFLOAT3(0,1500,-2600); mYaw=0; mPitch=-0.48f;
+            mTerrain.EnableLOD=mTerrainCapture!=7;
+            mTerrain.PaintVisible=mTerrainCapture!=8;
+        }
+        mTerrain.BrushEnabled=mTerrainCapture==9; // Mode 9 uses a deterministic screen-space cursor below.
+    }
+    if (strstr(GetCommandLineA(), "--terrain-brush-test") != nullptr)
+    {
+        mTerrain.RunBrushChecks();
+        return false;
     }
     if (strstr(GetCommandLineA(), "--terrain-test") != nullptr)
     {
@@ -550,16 +583,8 @@ void CrateApp::Update(const GameTimer& gt)
         CloseHandle(eventHandle);
     }
 
-    if (mTerrainMode)
-    {
-        mTerrain.Select(XMLoadFloat4x4(&mView), XMLoadFloat4x4(&mProj), static_cast<float>(mClientHeight));
-        mRenderSys.ClearLights();
-        mRenderSys.AddDirectionalLight(XMFLOAT3(0.4f,-0.8f,0.35f),XMFLOAT3(2.8f,2.65f,2.4f));
-        mRenderSys.SetShadowData(mShadowTransforms,mCascadeSplits,XMFLOAT3(0,0,1),false,false);
-        SetWindowText(mhMainWnd,mTerrain.Status().c_str());
-        return;
-    }
-
+    // Both views use the original scene, its animations, materials and lights.
+    RebuildDemoLights();
 	AnimateMaterials(gt);
 	UpdateSinusoidalAnimations(gt);
 	UpdateObjectCBs(gt);
@@ -568,6 +593,20 @@ void CrateApp::Update(const GameTimer& gt)
 	UpdateCascadedShadowMaps(gt);
 	UpdateTessellationCB(gt);
 	UpdateVisibleObjects();
+
+    if (mTerrainMode)
+    {
+        mTerrain.Select(XMLoadFloat4x4(&mView), XMLoadFloat4x4(&mProj), static_cast<float>(mClientHeight));
+        POINT cursor={-1,-1};
+        const bool focused=GetForegroundWindow()==mhMainWnd;
+        if(focused && GetCursorPos(&cursor)) ScreenToClient(mhMainWnd,&cursor);
+        const bool rotating=(GetAsyncKeyState(VK_RBUTTON)&0x8000)!=0;
+        if(mTerrainCapture==9) {cursor.x=mClientWidth/2; cursor.y=mClientHeight/2;}
+        mTerrain.UpdateBrush(XMLoadFloat4x4(&mView),XMLoadFloat4x4(&mProj),mClientWidth,mClientHeight,
+            cursor.x,cursor.y,mTerrainCapture==9 || (focused && !rotating && (GetAsyncKeyState(VK_LBUTTON)&0x8000)!=0),
+            (GetAsyncKeyState(VK_CONTROL)&0x8000)!=0,gt.DeltaTime());
+        SetWindowText(mhMainWnd,(L"Breakfast Room + Terrain | Home: room | " + mTerrain.Status()).c_str());
+    }
 }
 
 void CrateApp::Draw(const GameTimer& gt)
@@ -579,8 +618,9 @@ void CrateApp::Draw(const GameTimer& gt)
 
 	// PSO можно передать nullptr, потому что нужные PSO выставит RenderingSystem.
 	ThrowIfFailed(mCommandList->Reset(cmdListAlloc.Get(), nullptr));
+    if(mTerrainMode) mTerrain.UploadPaint(mCommandList.Get(),mCurrFrameResourceIndex);
 
-	if (mParticlesEnabled && !mTerrainMode)
+	if (mParticlesEnabled)
 	{
 		mParticleSystem.Update(
 			mCommandList.Get(),
@@ -596,7 +636,7 @@ void CrateApp::Draw(const GameTimer& gt)
 	// 0. CASCADED SHADOW PASS
 	// Каждый срез Texture2DArray получает depth направленного света.
 	//
-	if (mShadowsEnabled && !mTerrainMode)
+	if (mShadowsEnabled)
 	{
 		mRenderSys.BeginShadowPass(mCommandList.Get());
 
@@ -639,12 +679,6 @@ void CrateApp::Draw(const GameTimer& gt)
 		nullptr
 	);
 
-    if (mTerrainMode)
-    {
-        mTerrain.Draw(mCommandList.Get(),XMLoadFloat4x4(&mView)*XMLoadFloat4x4(&mProj));
-    }
-    else
-    {
 	// Для GeometryPass.hlsl нужна куча с обычными текстурами сцены.
 	ID3D12DescriptorHeap* descriptorHeaps[] = { mSrvDescriptorHeap.Get() };
 	mCommandList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
@@ -675,7 +709,10 @@ void CrateApp::Draw(const GameTimer& gt)
 		mParticleSystem.Draw(mCommandList.Get());
 	}
 
-    }
+    // Terrain changes the root signature/PSO/heap, so draw it after the scene.
+    // The same depth buffer gives correct occlusion between room and landscape.
+    if (mTerrainMode)
+        mTerrain.Draw(mCommandList.Get(),XMLoadFloat4x4(&mView)*XMLoadFloat4x4(&mProj));
 	// Переводим GBuffer из RENDER_TARGET в PIXEL_SHADER_RESOURCE.
 	mRenderSys.EndGeometryPass(mCommandList.Get());
 
@@ -808,12 +845,13 @@ void CrateApp::OnMouseDown(WPARAM btnState, int x, int y)
 
 void CrateApp::OnMouseUp(WPARAM btnState, int x, int y)
 {
-    ReleaseCapture();
+    if((btnState & MK_LBUTTON)==0) mTerrain.EndStroke();
+    if((btnState & (MK_LBUTTON|MK_RBUTTON))==0) ReleaseCapture();
 }
 
 void CrateApp::OnMouseMove(WPARAM btnState, int x, int y)
 {
-	if ((btnState & MK_LBUTTON) != 0)
+	if ((btnState & (mTerrainMode && mTerrain.BrushEnabled ? MK_RBUTTON : MK_LBUTTON)) != 0)
 	{
 		float dx = static_cast<float>(x - mLastMousePos.x);
 		float dy = static_cast<float>(y - mLastMousePos.y);
@@ -1330,6 +1368,7 @@ void CrateApp::AppendPostProcessStatus(std::wstring& title) const
 
 void CrateApp::OnKeyboardInput(const GameTimer& gt)
 {
+    if(GetForegroundWindow()!=mhMainWnd) return;
     bool terrainToggle = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
     if (terrainToggle && !mTerrainKeys[0])
     {
@@ -1338,6 +1377,7 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
         std::swap(mYaw,mOtherYaw);
         std::swap(mPitch,mOtherPitch);
         mTerrain.FreezeSelection = false;
+        mTerrain.EndStroke();
         XMStoreFloat4x4(&mProj,XMMatrixPerspectiveFovLH(0.25f*MathHelper::Pi,AspectRatio(),
             mTerrainMode?0.5f:1.0f,mTerrainMode?12000.0f:1000.0f));
     }
@@ -1346,13 +1386,13 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 	const float rangeSpeed = 10.0f * gt.DeltaTime();
 
 	// Выбор источника света.
-	if (GetAsyncKeyState('1') & 0x8000)
+	if (!mTerrainMode && (GetAsyncKeyState('1') & 0x8000))
 		mSelectedDemoLight = 1;
 
-	if (GetAsyncKeyState('2') & 0x8000)
+	if (!mTerrainMode && (GetAsyncKeyState('2') & 0x8000))
 		mSelectedDemoLight = 2;
 
-	if (GetAsyncKeyState('3') & 0x8000)
+	if (!mTerrainMode && (GetAsyncKeyState('3') & 0x8000))
 		mSelectedDemoLight = 3;
 
 	XMFLOAT3* selectedPos = nullptr;
@@ -1380,7 +1420,11 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 
 	float dt = gt.DeltaTime();
 
-	float cameraMoveSpeed = (mTerrainMode ? 180.0f : mCameraMoveSpeed) * dt;
+    // Room-scale navigation near the origin, fast flight out over the mountains.
+    const float distanceFromRoom = sqrtf(mCameraPos.x*mCameraPos.x +
+        mCameraPos.y*mCameraPos.y + mCameraPos.z*mCameraPos.z);
+    const float flightBlend = MathHelper::Clamp((distanceFromRoom-25.0f)/125.0f,0.0f,1.0f);
+	float cameraMoveSpeed = (mTerrainMode ? mCameraMoveSpeed+(180.0f-mCameraMoveSpeed)*flightBlend : mCameraMoveSpeed) * dt;
 
 	if (GetAsyncKeyState(VK_SHIFT) & 0x8000)
 		cameraMoveSpeed *= 3.0f;
@@ -1427,6 +1471,38 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 
     if (mTerrainMode)
     {
+        if (GetAsyncKeyState(VK_HOME)&0x8000)
+        {
+            mTerrain.EndStroke(); mTerrain.FreezeSelection=false;
+            mCameraPos=XMFLOAT3(3,3,8); mYaw=XM_PI; mPitch=-0.15f;
+        }
+        const bool ctrl=(GetAsyncKeyState(VK_CONTROL)&0x8000)!=0;
+        const int paintKeys[]={'P',VK_F2,VK_F3,'Z','Y',VK_F4};
+        for(unsigned k=0;k<6;++k)
+        {
+            bool down=(GetAsyncKeyState(paintKeys[k])&0x8000)!=0;
+            if(k==3 || k==4) down=down && ctrl;
+            if(down && !mTerrainPaintKeys[k])
+            {
+                mTerrain.EndStroke();
+                if(k==0)
+                {
+                    mTerrain.BrushEnabled=!mTerrain.BrushEnabled;
+                    if(mTerrain.BrushEnabled) {mTerrain.DebugMode=0; mTerrain.PaintVisible=true;}
+                }
+                if(k==1) mTerrain.SavePaint();
+                if(k==2) mTerrain.LoadPaint();
+                if(k==3) mTerrain.UndoPaint();
+                if(k==4) mTerrain.RedoPaint();
+                if(k==5) mTerrain.PaintVisible=!mTerrain.PaintVisible;
+            }
+            mTerrainPaintKeys[k]=down;
+        }
+        for(unsigned color=0;color<6;++color)
+            if(GetAsyncKeyState('1'+color)&0x8000) mTerrain.BrushColor=color;
+        if(GetAsyncKeyState(VK_OEM_4)&0x8000) mTerrain.BrushRadius-=80*dt;
+        if(GetAsyncKeyState(VK_OEM_6)&0x8000) mTerrain.BrushRadius+=80*dt;
+        mTerrain.BrushRadius=MathHelper::Clamp(mTerrain.BrushRadius,8.0f,300.0f);
         const int keys[] = {VK_F8,VK_F9,VK_F10,VK_F11,VK_F12,'L'};
         for(unsigned k=0;k<6;++k)
         {
@@ -1438,6 +1514,7 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
                 if(k==2) mTerrain.DebugMode=(mTerrain.DebugMode+1)%3;
                 if(k==3)
                 {
+                    mTerrain.EndStroke();
                     mTerrainCameraPreset=(mTerrainCameraPreset+1)%3;
                     const XMFLOAT3 cameras[]={XMFLOAT3(0,450,-1500),XMFLOAT3(-250,240,-700),XMFLOAT3(0,1500,-2600)};
                     const float pitches[]={-0.2f,-0.12f,-0.48f};
@@ -2423,8 +2500,8 @@ void CrateApp::UpdateMainPassCB(const GameTimer& gt)
 	mMainPassCB.EyePosW = mEyePos;
 	mMainPassCB.RenderTargetSize = XMFLOAT2((float)mClientWidth, (float)mClientHeight);
 	mMainPassCB.InvRenderTargetSize = XMFLOAT2(1.0f / mClientWidth, 1.0f / mClientHeight);
-	mMainPassCB.NearZ = 1.0f;
-	mMainPassCB.FarZ = 1000.0f;
+	mMainPassCB.NearZ = mTerrainMode ? 0.5f : 1.0f;
+	mMainPassCB.FarZ = mTerrainMode ? 12000.0f : 1000.0f;
 	mMainPassCB.TotalTime = gt.TotalTime();
 	mMainPassCB.DeltaTime = gt.DeltaTime();
 	mMainPassCB.AmbientLight = { 0.6f, 0.6f, 0.6f, 1.0f }; // было 0.25

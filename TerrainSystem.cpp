@@ -20,11 +20,11 @@ namespace
     };
     static_assert(sizeof(Header) == 36, "Terrain header layout");
     struct GridVertex { float X, Z, Skirt; };
-    struct DrawConstants { XMFLOAT4X4 VP; XMFLOAT4 Tile, Options; };
-    static_assert(sizeof(DrawConstants) == 96, "Terrain shader layout");
+    struct DrawConstants { XMFLOAT4X4 VP; XMFLOAT4 Tile, Options, Brush, BrushColor, PaintMap; };
+    static_assert(sizeof(DrawConstants) == 144, "Terrain shader layout");
 }
 
-void TerrainSystem::Initialize(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, DXGI_FORMAT depthFormat)
+void TerrainSystem::Initialize(ID3D12Device* device, ID3D12GraphicsCommandList* cmd, DXGI_FORMAT depthFormat, unsigned frameCount)
 {
     std::ifstream file("Assets/Terrain/terrain.bin", std::ios::binary);
     Header header = {};
@@ -57,6 +57,12 @@ void TerrainSystem::Initialize(ID3D12Device* device, ID3D12GraphicsCommandList* 
     std::vector<uint16_t> heights(layerElements*mNodes.size());
     if (!file.read(reinterpret_cast<char*>(heights.data()), heights.size()*sizeof(uint16_t)))
         throw std::runtime_error("Truncated terrain height tiles");
+    mHeightCPU = heights; // Exact rendered LOD heights for cursor ray/triangle intersection.
+    for (uint16_t value : heights)
+    {
+        mTerrainFingerprint = (mTerrainFingerprint ^ (value & 255u))*16777619u;
+        mTerrainFingerprint = (mTerrainFingerprint ^ (value >> 8))*16777619u;
+    }
 
     auto heapDefault = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
     auto heapUpload = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
@@ -75,7 +81,7 @@ void TerrainSystem::Initialize(ID3D12Device* device, ID3D12GraphicsCommandList* 
         D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     cmd->ResourceBarrier(1,&barrier);
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-    heapDesc.NumDescriptors=1; heapDesc.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heapDesc.NumDescriptors=2; heapDesc.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heapDesc.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ThrowIfFailed(device->CreateDescriptorHeap(&heapDesc,IID_PPV_ARGS(&mHeap)));
     D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
@@ -83,6 +89,7 @@ void TerrainSystem::Initialize(ID3D12Device* device, ID3D12GraphicsCommandList* 
     srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2DArray.ArraySize=header.Nodes; srv.Texture2DArray.MipLevels=1;
     device->CreateShaderResourceView(mHeightTiles.Get(),&srv,mHeap->GetCPUDescriptorHandleForHeapStart());
+    InitializePaint(device,cmd,frameCount);
 
     std::vector<GridVertex> vertices;
     std::vector<uint32_t> indices;
@@ -120,10 +127,16 @@ void TerrainSystem::Initialize(ID3D12Device* device, ID3D12GraphicsCommandList* 
 
     CD3DX12_DESCRIPTOR_RANGE range;
     range.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV,1,0);
-    CD3DX12_ROOT_PARAMETER params[2];
+    CD3DX12_DESCRIPTOR_RANGE paintRange;
+    paintRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV,1,1);
+    CD3DX12_ROOT_PARAMETER params[3];
     params[0].InitAsDescriptorTable(1,&range,D3D12_SHADER_VISIBILITY_VERTEX);
     params[1].InitAsConstants(sizeof(DrawConstants)/4,0);
-    CD3DX12_ROOT_SIGNATURE_DESC rootDesc(2,params,0,nullptr,D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+    params[2].InitAsDescriptorTable(1,&paintRange,D3D12_SHADER_VISIBILITY_PIXEL);
+    CD3DX12_STATIC_SAMPLER_DESC paintSampler(0,D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP,D3D12_TEXTURE_ADDRESS_MODE_CLAMP,D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+    paintSampler.ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;
+    CD3DX12_ROOT_SIGNATURE_DESC rootDesc(3,params,1,&paintSampler,D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
     ComPtr<ID3DBlob> serialized,errors;
     ThrowIfFailed(D3D12SerializeRootSignature(&rootDesc,D3D_ROOT_SIGNATURE_VERSION_1,&serialized,&errors));
     ThrowIfFailed(device->CreateRootSignature(0,serialized->GetBufferPointer(),serialized->GetBufferSize(),IID_PPV_ARGS(&mRoot)));
@@ -157,8 +170,23 @@ void TerrainSystem::ReleaseUploadBuffers()
 BoundingBox TerrainSystem::Bounds(const TerrainNode& n) const
 {
     float bottom=n.MinHeight-n.SkirtDepth;
+    if (TouchesSceneClearing(n)) bottom=(std::min)(bottom,-2.0f-n.SkirtDepth);
     return BoundingBox(XMFLOAT3(n.X+n.Size*0.5f,(bottom+n.MaxHeight)*0.5f,n.Z+n.Size*0.5f),
         XMFLOAT3(n.Size*0.5f,(n.MaxHeight-bottom)*0.5f,n.Size*0.5f));
+}
+
+float TerrainSystem::SceneHeight(float x,float z,float height)
+{
+    // Flat ground below the entire original room (lowest vertex is Y=-1.74).
+    float t=(std::max)(0.0f,(std::min)(1.0f,(sqrtf(x*x+z*z)-24.0f)/156.0f));
+    t=t*t*(3.0f-2.0f*t);
+    return -2.0f+(height+2.0f)*t;
+}
+
+bool TerrainSystem::TouchesSceneClearing(const TerrainNode& n)
+{
+    return n.X<=180.0f && n.X+n.Size>=-180.0f &&
+        n.Z<=180.0f && n.Z+n.Size>=-180.0f;
 }
 
 void TerrainSystem::Select(CXMMATRIX view,CXMMATRIX projection,float viewportHeight)
@@ -192,7 +220,9 @@ void TerrainSystem::Visit(unsigned index)
     float depth=(box.Center.x-mSelectionEye.x)*f.x+(box.Center.y-mSelectionEye.y)*f.y+(box.Center.z-mSelectionEye.z)*f.z;
     depth-=std::abs(f.x)*box.Extents.x+std::abs(f.y)*box.Extents.y+std::abs(f.z)*box.Extents.z;
     float pixelError=node.Error*mProjectionScale/(std::max)(1.0f,depth);
-    if (node.Level<mMaxDepth && (!EnableLOD || pixelError>PixelError))
+    // Original error bounds describe the unmodified heightmap. Keep the small
+    // clearing at full detail so its new profile never buries the room at coarse LOD.
+    if (node.Level<mMaxDepth && (!EnableLOD || TouchesSceneClearing(node) || pixelError>PixelError))
     {
         for (int child:node.Children) Visit(static_cast<unsigned>(child));
     }
@@ -210,10 +240,15 @@ void TerrainSystem::Draw(ID3D12GraphicsCommandList* cmd,CXMMATRIX viewProjection
     ID3D12DescriptorHeap* heaps[]={mHeap.Get()};
     cmd->SetDescriptorHeaps(1,heaps);
     cmd->SetGraphicsRootDescriptorTable(0,mHeap->GetGPUDescriptorHandleForHeapStart());
+    cmd->SetGraphicsRootDescriptorTable(2,mPaintSRV);
     cmd->IASetVertexBuffers(0,1,&mVBView); cmd->IASetIndexBuffer(&mIBView);
     cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     DrawConstants cb;
     XMStoreFloat4x4(&cb.VP,XMMatrixTranspose(viewProjection));
+    const auto color=PaintColor();
+    cb.Brush=XMFLOAT4(mBrushPosition.x,mBrushPosition.z,BrushRadius,BrushEnabled && mBrushHit?1.0f:0.0f);
+    cb.BrushColor=mBrushErase?XMFLOAT4(1,1,1,1):XMFLOAT4(color.x,color.y,color.z,1);
+    cb.PaintMap=XMFLOAT4(1.0f/mWorldSize,PaintVisible?1.0f:0.0f,0,0);
     for (unsigned index:mSelected)
     {
         const auto& n=mNodes[index];
@@ -227,6 +262,11 @@ void TerrainSystem::Draw(ID3D12GraphicsCommandList* cmd,CXMMATRIX viewProjection
 std::wstring TerrainSystem::Status() const
 {
     std::wostringstream s;
+    const wchar_t* names[]={L"Red",L"Blue",L"Green",L"Yellow",L"White",L"Black"};
+    s<<L"Brush "<<(BrushEnabled?L"ON":L"OFF")<<L" [P] "<<names[BrushColor%6]<<L" [1-6] R="<<int(BrushRadius)
+        <<L"m [[]] | LMB paint / Ctrl erase / RMB look | F2 save F3 load | "
+        <<(PaintVisible?L"Paint ON":L"Paint OFF")<<L" [F4] | ";
+    if(!mPaintMessage.empty()) s<<mPaintMessage<<L" | ";
     s<<L"TERRAIN [F7] | LOD "<<(EnableLOD?L"ON":L"FULL")<<L" [F8] | Cull "<<(EnableCulling?L"ON":L"OFF")
         <<L" [F9] | Tiles/Draws "<<mSelected.size()<<L" | Tris "<<mSelected.size()*(EnableSkirts?mIndexCount:mSurfaceIndexCount)/3
         <<L" | Nodes "<<mVisited<<L" | Rejected "<<mRejected<<L" | HiddenLeaves "<<mHiddenLeaves
@@ -256,6 +296,8 @@ void TerrainSystem::RunSelectionChecks()
     for(unsigned index:mSelected)
     {
         const auto& n=mNodes[index];
+        require(!TouchesSceneClearing(n) || n.Level==mMaxDepth,
+            "Central clearing must retain full detail around Breakfast Room");
         unsigned x=static_cast<unsigned>(std::lround((n.X/mWorldSize+0.5f)*side));
         unsigned z=static_cast<unsigned>(std::lround((n.Z/mWorldSize+0.5f)*side));
         unsigned span=1u<<(mMaxDepth-n.Level);
@@ -263,6 +305,19 @@ void TerrainSystem::RunSelectionChecks()
     }
     for(unsigned count:coverage) require(count==1,"LOD cover has a gap or parent-child overlap");
     log<<"Adaptive cover: each leaf cell covered exactly once\n";
+    for(unsigned index=0;index<mNodes.size();++index)
+    {
+        const auto& n=mNodes[index];
+        const auto box=Bounds(n);
+        for(unsigned z=0;z<=mGridCells;++z) for(unsigned x=0;x<=mGridCells;++x)
+        {
+            float h=mHeightCPU[index*mTileSize*mTileSize+(z+1)*mTileSize+x+1]/65535.0f*mHeightScale;
+            h=SceneHeight(n.X+x*n.Size/mGridCells,n.Z+z*n.Size/mGridCells,h);
+            require(h-n.SkirtDepth>=box.Center.y-box.Extents.y-0.01f &&
+                h<=box.Center.y+box.Extents.y+0.01f,"Clearing exceeds culling bounds");
+        }
+    }
+    log<<"Central clearing: full detail and conservative height bounds PASS\n";
     const size_t overview=mSelected.size();
     auto distant=XMMatrixLookAtLH(XMVectorSet(0,1500,-6000,1),XMVectorSet(0,100,0,1),XMVectorSet(0,1,0,0));
     Select(distant,projection,720);
