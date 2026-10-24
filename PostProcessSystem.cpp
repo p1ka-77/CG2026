@@ -257,6 +257,108 @@ void PostProcessSystem::BuildSizeDependentResources(
         destination.Offset(1, mSrvDescriptorSize);
         source.Offset(1, mSrvDescriptorSize);
     }
+    ResetTAA(); mHistoryIndex=0;
+    if (!mTaaRoot)
+    {
+        CD3DX12_DESCRIPTOR_RANGE range;
+        range.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV,4,0);
+        CD3DX12_ROOT_PARAMETER params[2];
+        params[0].InitAsDescriptorTable(1,&range,D3D12_SHADER_VISIBILITY_PIXEL);
+        params[1].InitAsConstants(40,0);
+        CD3DX12_STATIC_SAMPLER_DESC sampler(0,D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP,D3D12_TEXTURE_ADDRESS_MODE_CLAMP,D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+        CD3DX12_ROOT_SIGNATURE_DESC root(2,params,1,&sampler);
+        ComPtr<ID3DBlob> blob,error;
+        ThrowIfFailed(D3D12SerializeRootSignature(&root,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&error));
+        ThrowIfFailed(device->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&mTaaRoot)));
+        auto vs=d3dUtil::CompileShader(L"Shaders\\TemporalAA.hlsl",nullptr,"VS","vs_5_0");
+        auto ps=d3dUtil::CompileShader(L"Shaders\\TemporalAA.hlsl",nullptr,"PS","ps_5_0");
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso={};
+        pso.pRootSignature=mTaaRoot.Get();
+        pso.VS={vs->GetBufferPointer(),vs->GetBufferSize()};
+        pso.PS={ps->GetBufferPointer(),ps->GetBufferSize()};
+        pso.RasterizerState=CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+        pso.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;
+        pso.BlendState=CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+        pso.DepthStencilState=CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+        pso.DepthStencilState.DepthEnable=FALSE;
+        pso.DepthStencilState.DepthWriteMask=D3D12_DEPTH_WRITE_MASK_ZERO;
+        pso.SampleMask=UINT_MAX; pso.SampleDesc.Count=1;
+        pso.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pso.NumRenderTargets=2; pso.RTVFormats[0]=mRenderTargetFormat;
+        pso.RTVFormats[1]=GBUFFER_FORMATS[0];
+        ThrowIfFailed(device->CreateGraphicsPipelineState(&pso,IID_PPV_ARGS(&mTaaPSO)));
+    }
+    D3D12_DESCRIPTOR_HEAP_DESC rtvDesc={};
+    rtvDesc.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV; rtvDesc.NumDescriptors=4;
+    mTaaRTVs.Reset();
+    ThrowIfFailed(device->CreateDescriptorHeap(&rtvDesc,IID_PPV_ARGS(&mTaaRTVs)));
+    UINT rtvStep=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    mTaaRtvStep=rtvStep;
+    for(UINT i=0;i<2;++i)
+    {
+        mHistory[i].Reset(); mHistoryPosition[i].Reset(); mTaaHeaps[i].Reset();
+        auto colorDesc=mSceneColor->GetDesc();
+        ThrowIfFailed(device->CreateCommittedResource(&defaultHeap,D3D12_HEAP_FLAG_NONE,&colorDesc,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&mHistory[i])));
+        colorDesc.Format=GBUFFER_FORMATS[0];
+        ThrowIfFailed(device->CreateCommittedResource(&defaultHeap,D3D12_HEAP_FLAG_NONE,&colorDesc,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&mHistoryPosition[i])));
+        auto rtv=mTaaRTVs->GetCPUDescriptorHandleForHeapStart(); rtv.ptr+=i*2*rtvStep;
+        device->CreateRenderTargetView(mHistory[i].Get(),nullptr,rtv);
+        rtv.ptr+=rtvStep; device->CreateRenderTargetView(mHistoryPosition[i].Get(),nullptr,rtv);
+        auto dest=mPostProcessSrvHeap->GetCPUDescriptorHandleForHeapStart(); dest.ptr+=(4+i)*mSrvDescriptorSize;
+        device->CreateShaderResourceView(mHistory[i].Get(),&sceneColorSrv,dest);
+    }
+    for(UINT i=0;i<2;++i)
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC hd={}; hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors=4; hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        ThrowIfFailed(device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&mTaaHeaps[i])));
+        auto dst=mTaaHeaps[i]->GetCPUDescriptorHandleForHeapStart();
+        device->CreateShaderResourceView(mSceneColor.Get(),&sceneColorSrv,dst);
+        dst.ptr+=mSrvDescriptorSize;
+        device->CopyDescriptorsSimple(1,dst,gBufferSrvHeap->GetCPUDescriptorHandleForHeapStart(),hd.Type);
+        dst.ptr+=mSrvDescriptorSize;
+        device->CreateShaderResourceView(mHistory[1-i].Get(),&sceneColorSrv,dst);
+        dst.ptr+=mSrvDescriptorSize;
+        auto posSrv=sceneColorSrv; posSrv.Format=GBUFFER_FORMATS[0];
+        device->CreateShaderResourceView(mHistoryPosition[1-i].Get(),&posSrv,dst);
+    }
+}
+
+void PostProcessSystem::ResolveTAA(ID3D12GraphicsCommandList* cmd,CXMMATRIX vp,XMFLOAT2 jitter)
+{
+    mCurrentJitter=jitter;
+    if(!TAAEnabled) {ResetTAA(); return;}
+    auto color=mHistory[mHistoryIndex].Get(),position=mHistoryPosition[mHistoryIndex].Get();
+    D3D12_RESOURCE_BARRIER barriers[]={
+        CD3DX12_RESOURCE_BARRIER::Transition(color,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_RENDER_TARGET),
+        CD3DX12_RESOURCE_BARRIER::Transition(position,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_RENDER_TARGET)};
+    cmd->ResourceBarrier(2,barriers);
+    auto rtv=mTaaRTVs->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr+=mHistoryIndex*2*mTaaRtvStep;
+    cmd->OMSetRenderTargets(2,&rtv,TRUE,nullptr);
+    cmd->SetGraphicsRootSignature(mTaaRoot.Get()); cmd->SetPipelineState(mTaaPSO.Get());
+    ID3D12DescriptorHeap* heaps[]={mTaaHeaps[mHistoryIndex].Get()};
+    cmd->SetDescriptorHeaps(1,heaps); cmd->SetGraphicsRootDescriptorTable(0,heaps[0]->GetGPUDescriptorHandleForHeapStart());
+    struct Constants {XMFLOAT4X4 PreviousVP,CurrentVP; XMFLOAT2 InvSize,Jitter; UINT Valid; float Weight; XMFLOAT2 Padding;};
+    static_assert(sizeof(Constants)==160,"TAA shader constants");
+    Constants c={}; c.PreviousVP=mPreviousVP;
+    XMStoreFloat4x4(&c.CurrentVP,XMMatrixTranspose(vp));
+    c.Padding.x=1.0f;
+    const float* previous=&c.PreviousVP._11;
+    const float* current=&c.CurrentVP._11;
+    for(UINT i=0;i<16;++i) if(fabsf(previous[i]-current[i])>0.000001f) c.Padding.x=0.0f;
+    c.InvSize={1.0f/mWidth,1.0f/mHeight}; c.Jitter=jitter;
+    c.Valid=mHistoryValid?1u:0u; c.Weight=0.9f;
+    cmd->SetGraphicsRoot32BitConstants(1,40,&c,0);
+    cmd->IASetVertexBuffers(0,0,nullptr); cmd->IASetIndexBuffer(nullptr);
+    cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST); cmd->DrawInstanced(3,1,0,0);
+    for(auto& b:barriers) std::swap(b.Transition.StateBefore,b.Transition.StateAfter);
+    cmd->ResourceBarrier(2,barriers);
+    XMStoreFloat4x4(&mPreviousVP,XMMatrixTranspose(vp));
+    mResolvedIndex=mHistoryIndex; mHistoryIndex=1-mHistoryIndex; mHistoryValid=true;
 }
 
 void PostProcessSystem::BeginSceneColorPass(
@@ -308,6 +410,8 @@ void PostProcessSystem::Draw(
         mPostProcessSrvHeap->GetGPUDescriptorHandleForHeapStart());
 
     PostProcessConstants constants;
+    constants.CurrentJitter=mCurrentJitter;
+    constants.Padding1={TAAEnabled?float(mResolvedIndex+1):0.0f,TAAEnabled && TAASplit?1.0f:0.0f};
     constants.EffectMode = effectMode;
     constants.Strength = strength;
     constants.VignetteStrength = vignetteEnabled ? strength : 0.0f;

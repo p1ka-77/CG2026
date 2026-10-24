@@ -155,6 +155,8 @@
     <ClCompile Include="ParticleSystem.cpp" />
     <ClCompile Include="PostProcessSystem.cpp" />
     <ClCompile Include="RenderingSystem.cpp" />
+    <ClCompile Include="TerrainSystem.cpp" />
+    <ClCompile Include="TerrainPainting.cpp" />
     <ClCompile Include="TextureAnimation.cpp" />
     <ClCompile Include="TextureManager.cpp" />
   </ItemGroup>
@@ -173,6 +175,7 @@
     <ClInclude Include="ParticleSystem.h" />
     <ClInclude Include="PostProcessSystem.h" />
     <ClInclude Include="RenderingSystem.h" />
+    <ClInclude Include="TerrainSystem.h" />
     <ClInclude Include="TextureAnimation.h" />
     <ClInclude Include="TextureManager.h" />
   </ItemGroup>
@@ -218,10 +221,19 @@
       <FileType>Document</FileType>
     </None>
     <None Include="Models\particle_teapot.obj" />
+    <None Include="Shaders\TerrainPass.hlsl" />
+    <None Include="Assets\Terrain\terrain.bin" />
+    <None Include="Tools\generate_ant_terrain.py" />
+    <None Include="Tools\pack_terrain.py" />
+    <None Include="Tools\verify_terrain.py" />
+    <None Include="TERRAIN_LAB.md" />
+    <None Include="TERRAIN_PAINTING.md" />
+    <None Include="TERRAIN_WATER_PRECISION_EXPLAINED_RU.md" />
     <None Include="Tools\extract_particle_teapot.py" />
     <None Include="Shaders\PostProcessPass.hlsl">
       <FileType>Document</FileType>
     </None>
+    <None Include="Shaders\TemporalAA.hlsl"><FileType>Document</FileType></None>
     <None Include="Shaders\ShadowPass.hlsl">
       <FileType>Document</FileType>
     </None>

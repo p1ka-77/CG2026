@@ -128,6 +128,12 @@ public:
     ~CrateApp();
 
     virtual bool Initialize()override;
+    LRESULT MsgProc(HWND hwnd,UINT msg,WPARAM wParam,LPARAM lParam) override
+    {
+        // The app owns its status caption; suppress the base FPS caption overwrite.
+        if(msg==WM_SETTEXT && !mTitleWritable && !mStatusTitle.empty()) return TRUE;
+        return D3DApp::MsgProc(hwnd,msg,wParam,lParam);
+    }
 
 private:
     virtual void OnResize()override;
@@ -232,6 +238,17 @@ private:
 	ParticleSystem mParticleSystem;
 
     PostProcessSystem mPostProcessSystem;
+    UINT mTaaFrame=0;
+    XMFLOAT2 mTaaJitter={};
+    XMFLOAT4X4 mStableProj=MathHelper::Identity4x4();
+    std::wstring mStatusTitle;
+    bool mTitleWritable=false;
+    float mTitleTime=-1;
+    int mTaaSequenceRemaining=0;
+    bool mTaaKeys[3]={};
+    XMFLOAT3 mTaaCamera={};
+    float mTaaYaw=0,mTaaPitch=0;
+    int mTaaCaptureFrames=0;
     TerrainSystem mTerrain;
     bool mTerrainMode = true;
     int mTerrainCapture = -1; // Optional automated GPU readback check, never used during normal play.
@@ -494,6 +511,19 @@ bool CrateApp::Initialize()
     if (const char* capture = strstr(GetCommandLineA(), "--terrain-capture="))
     {
         mTerrainCapture = atoi(capture + strlen("--terrain-capture="));
+        if(mTerrainCapture>=30 && mTerrainCapture<=32)
+        {
+            mTaaCaptureFrames=32; mTaaSequenceRemaining=16;
+            mPostProcessSystem.TAAEnabled=mTerrainCapture!=30;
+            mPostProcessSystem.TAASplit=mTerrainCapture==32;
+            mParticlesEnabled=false;
+        }
+        if(mTerrainCapture>=20 && mTerrainCapture<=22)
+        {
+            mTaaCaptureFrames=32;
+            mPostProcessSystem.TAAEnabled=mTerrainCapture!=20;
+            mPostProcessSystem.TAASplit=mTerrainCapture==22;
+        }
         mTerrain.DebugMode = mTerrainCapture == 1 ? 1 : mTerrainCapture == 2 ? 2 : 0;
         if (mTerrainCapture <= 2 || mTerrainCapture == 4)
         { mCameraPos=XMFLOAT3(0,450,-1500); mYaw=0; mPitch=-0.2f; }
@@ -568,6 +598,21 @@ void CrateApp::Update(const GameTimer& gt)
 
 	OnKeyboardInput(gt);
 	UpdateCamera(gt);
+    const float cameraJump=fabsf(mCameraPos.x-mTaaCamera.x)+fabsf(mCameraPos.y-mTaaCamera.y)+fabsf(mCameraPos.z-mTaaCamera.z);
+    if(cameraJump>30 || fabsf(mYaw-mTaaYaw)>0.8f || fabsf(mPitch-mTaaPitch)>0.8f)
+        mPostProcessSystem.ResetTAA();
+    mTaaCamera=mCameraPos; mTaaYaw=mYaw; mTaaPitch=mPitch;
+    XMMATRIX projection=XMMatrixPerspectiveFovLH(0.25f*MathHelper::Pi,AspectRatio(),mTerrainMode?0.5f:1.0f,mTerrainMode?12000.0f:1000.0f);
+    XMStoreFloat4x4(&mProj,projection);
+    mStableProj=mProj; mTaaJitter={};
+    if(mPostProcessSystem.TAAEnabled)
+    {
+        auto halton=[](UINT index,UINT base) {float result=0,fraction=1; while(index) {fraction/=base; result+=fraction*(index%base); index/=base;} return result;};
+        UINT sample=(mTaaFrame++%8)+1;
+        mTaaJitter={halton(sample,2)-0.5f,halton(sample,3)-0.5f};
+        mProj._31+=mTaaJitter.x*2.0f/mClientWidth;
+        mProj._32-=mTaaJitter.y*2.0f/mClientHeight;
+    }
 
     // Cycle through the circular frame resource array.
     mCurrFrameResourceIndex = (mCurrFrameResourceIndex + 1) % gNumFrameResources;
@@ -585,8 +630,7 @@ void CrateApp::Update(const GameTimer& gt)
 
     // Both views use the original scene, its animations, materials and lights.
     RebuildDemoLights();
-	AnimateMaterials(gt);
-	UpdateSinusoidalAnimations(gt);
+    if(!mTaaSequenceRemaining) {AnimateMaterials(gt); UpdateSinusoidalAnimations(gt);}
 	UpdateObjectCBs(gt);
 	UpdateMaterialCBs(gt);
 	UpdateMainPassCB(gt);
@@ -605,7 +649,14 @@ void CrateApp::Update(const GameTimer& gt)
         mTerrain.UpdateBrush(XMLoadFloat4x4(&mView),XMLoadFloat4x4(&mProj),mClientWidth,mClientHeight,
             cursor.x,cursor.y,mTerrainCapture==9 || (focused && !rotating && (GetAsyncKeyState(VK_LBUTTON)&0x8000)!=0),
             (GetAsyncKeyState(VK_CONTROL)&0x8000)!=0,gt.DeltaTime());
-        SetWindowText(mhMainWnd,(L"Breakfast Room + Terrain | Home: room | " + mTerrain.Status()).c_str());
+        std::wstring taa=mPostProcessSystem.TAAEnabled?L"TAA ON":L"TAA OFF";
+        if(mPostProcessSystem.TAASplit) taa+=L" | LEFT RAW / RIGHT TAA";
+        mStatusTitle=taa+L" [F1] Split [Tab] Reset [Delete] | Home: room | " + mTerrain.Status();
+    }
+    if(gt.TotalTime()-mTitleTime>=0.25f)
+    {
+        mTitleWritable=true; SetWindowText(mhMainWnd,mStatusTitle.c_str()); mTitleWritable=false;
+        mTitleTime=gt.TotalTime();
     }
 }
 
@@ -741,7 +792,7 @@ void CrateApp::Draw(const GameTimer& gt)
 
     mRenderSys.SetShadowPattern(mShadowPatternEnabled && !mTerrainMode, mShadowPatternScale);
     D3D12_CPU_DESCRIPTOR_HANDLE lightingTarget = CurrentBackBufferView();
-    if (mPostProcessEnabled && !mTerrainMode)
+    // Capture lit color for the common TAA/final post-processing path.
     {
         // Lighting first writes the fully lit frame into an off-screen texture.
         mPostProcessSystem.BeginSceneColorPass(mCommandList.Get());
@@ -757,24 +808,24 @@ void CrateApp::Draw(const GameTimer& gt)
 		mTerrainMode ? XMFLOAT4(0.28f,0.32f,0.38f,1.0f) : XMFLOAT4(0.05f, 0.05f, 0.05f, 1.0f)
 	);
 
-    if (mPostProcessEnabled && !mTerrainMode)
     {
         mPostProcessSystem.EndSceneColorPass(mCommandList.Get());
+        mPostProcessSystem.ResolveTAA(mCommandList.Get(),XMLoadFloat4x4(&mView)*XMLoadFloat4x4(&mStableProj),mTaaJitter);
         mPostProcessSystem.Draw(
             mCommandList.Get(),
             CurrentBackBufferView(),
             mScreenViewport,
             mScissorRect,
-            mPostProcessMode,
-            mPostProcessStrength,
-            mVignetteEnabled);
+            mPostProcessEnabled && !mTerrainMode ? mPostProcessMode : 0,
+            mPostProcessEnabled && !mTerrainMode ? mPostProcessStrength : 0,
+            mVignetteEnabled && mPostProcessEnabled && !mTerrainMode);
     }
 
 
     ComPtr<ID3D12Resource> captureReadback;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT captureLayout = {};
     UINT64 captureSize = 0;
-    if (mTerrainCapture >= 0)
+    if (mTerrainCapture >= 0 && mTaaCaptureFrames--<=0)
     {
         auto desc = CurrentBackBuffer()->GetDesc();
         if (desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM)
@@ -818,14 +869,15 @@ void CrateApp::Draw(const GameTimer& gt)
         unsigned char* pixels = nullptr;
         D3D12_RANGE readRange={0,static_cast<SIZE_T>(captureSize)};
         ThrowIfFailed(captureReadback->Map(0,&readRange,reinterpret_cast<void**>(&pixels)));
-        std::ofstream output("terrain_capture_"+std::to_string(mTerrainCapture)+".ppm",std::ios::binary);
+        std::string suffix=mTaaSequenceRemaining ? "_"+std::to_string(16-mTaaSequenceRemaining) : "";
+        std::ofstream output("terrain_capture_"+std::to_string(mTerrainCapture)+suffix+".ppm",std::ios::binary);
         output<<"P6\n"<<mClientWidth<<" "<<mClientHeight<<"\n255\n";
         for(int y=0;y<mClientHeight;++y) for(int x=0;x<mClientWidth;++x)
             output.write(reinterpret_cast<const char*>(pixels+captureLayout.Offset+y*captureLayout.Footprint.RowPitch+x*4),3);
         D3D12_RANGE noWrite={0,0}; captureReadback->Unmap(0,&noWrite);
         if(!output) throw std::runtime_error("Cannot write frame capture");
-        mTerrainCapture=-1;
-        PostQuitMessage(0);
+        if(!mTaaSequenceRemaining || --mTaaSequenceRemaining==0)
+        {mTerrainCapture=-1; PostQuitMessage(0);}
     }
 
 	ThrowIfFailed(mSwapChain->Present(0, 0));
@@ -1258,7 +1310,7 @@ void CrateApp::UpdateVisibleObjects()
 			: L" | Particles: OFF [4]";
         AppendPostProcessStatus(title);
 
-		SetWindowText(mhMainWnd, title.c_str());
+		mStatusTitle=title;
 		return;
 	}
 
@@ -1337,11 +1389,12 @@ void CrateApp::UpdateVisibleObjects()
 		: L" | Particles: OFF [4]";
     AppendPostProcessStatus(title);
 
-	SetWindowText(mhMainWnd, title.c_str());
+	mStatusTitle=title;
 }
 
 void CrateApp::AppendPostProcessStatus(std::wstring& title) const
 {
+    title=(mPostProcessSystem.TAAEnabled?L"TAA ON [F1] | ":L"TAA OFF [F1] | ")+title;
     // Put the new controls FIRST so they remain visible in a narrow title bar.
     title = std::wstring(mShadowPatternEnabled ? L"Skulls ON" : L"Skulls OFF") + L" [F3, [/]] | "
         + (mMeshParticles ? L"Teapots" : L"Spheres") + L" [F4] | Vignette "
@@ -1369,10 +1422,23 @@ void CrateApp::AppendPostProcessStatus(std::wstring& title) const
 void CrateApp::OnKeyboardInput(const GameTimer& gt)
 {
     if(GetForegroundWindow()!=mhMainWnd) return;
+    const int taaKeys[]={VK_F1,VK_TAB,VK_DELETE};
+    for(UINT i=0;i<3;++i)
+    {
+        bool down=(GetAsyncKeyState(taaKeys[i])&0x8000)!=0;
+        if(down && !mTaaKeys[i])
+        {
+            if(i==0) mPostProcessSystem.TAAEnabled=!mPostProcessSystem.TAAEnabled;
+            if(i==1) {mPostProcessSystem.TAASplit=!mPostProcessSystem.TAASplit; mPostProcessSystem.TAAEnabled=true;}
+            mPostProcessSystem.ResetTAA(); mTaaFrame=0;
+        }
+        mTaaKeys[i]=down;
+    }
     bool terrainToggle = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
     if (terrainToggle && !mTerrainKeys[0])
     {
         mTerrainMode = !mTerrainMode;
+        mPostProcessSystem.ResetTAA();
         std::swap(mCameraPos,mOtherCameraPos);
         std::swap(mYaw,mOtherYaw);
         std::swap(mPitch,mOtherPitch);

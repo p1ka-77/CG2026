@@ -20,9 +20,11 @@ struct PostProcessConstants
 
     XMFLOAT2 InvRenderTargetSize = { 1.0f, 1.0f };
     XMFLOAT2 Padding1 = { 0.0f, 0.0f };
+    XMFLOAT2 CurrentJitter = {};
+    XMFLOAT2 Padding2 = {};
 };
 
-static_assert(sizeof(PostProcessConstants) == 32,
+static_assert(sizeof(PostProcessConstants) == 48,
     "PostProcessConstants must match the HLSL constant buffer");
 
 class PostProcessSystem
@@ -55,6 +57,10 @@ public:
 
     D3D12_CPU_DESCRIPTOR_HANDLE GetSceneColorRTV() const;
     bool IsInitialized() const { return mInitialized; }
+    void ResolveTAA(ID3D12GraphicsCommandList* cmd, CXMMATRIX viewProjection, XMFLOAT2 jitter);
+    void ResetTAA() { mHistoryValid=false; }
+    bool TAAEnabled = true;
+    bool TAASplit = false;
 
 private:
     void BuildRootSignature(ID3D12Device* device);
@@ -66,7 +72,16 @@ private:
         ID3D12DescriptorHeap* gBufferSrvHeap);
 
 private:
-    static constexpr UINT PostProcessSrvCount = 4;
+    static constexpr UINT PostProcessSrvCount = 6;
+    ComPtr<ID3D12Resource> mHistory[2], mHistoryPosition[2];
+    ComPtr<ID3D12DescriptorHeap> mTaaHeaps[2], mTaaRTVs;
+    ComPtr<ID3D12RootSignature> mTaaRoot;
+    ComPtr<ID3D12PipelineState> mTaaPSO;
+    XMFLOAT4X4 mPreviousVP = {};
+    bool mHistoryValid=false;
+    UINT mHistoryIndex=0, mResolvedIndex=0;
+    UINT mTaaRtvStep=0;
+    XMFLOAT2 mCurrentJitter={};
 
     bool mInitialized = false;
     UINT mWidth = 1;
