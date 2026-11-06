@@ -47,6 +47,7 @@ struct GBufferOutput
     float4 Position : SV_Target0;
     float4 Normal : SV_Target1;
     float4 Albedo : SV_Target2;
+    float4 PreviousPosition : SV_Target3;
 };
 
 GBufferOutput PS(VertexOut input)
@@ -77,6 +78,7 @@ GBufferOutput PS(VertexOut input)
     }
     GBufferOutput output;
     output.Position=float4(input.PosW,1);
+    output.PreviousPosition=output.Position;
     output.Normal=float4(normal*0.5+0.5,1);
     output.Albedo=float4(color,0.9);
     return output;

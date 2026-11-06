@@ -1,17 +1,17 @@
 // TessellationPass.hlsl
-// Geometry Pass для tessellated surface.
-// Пишет данные в GBuffer: position / normal / albedo+roughness.
+// Geometry Pass РґР»СЏ tessellated surface.
+// РџРёС€РµС‚ РґР°РЅРЅС‹Рµ РІ GBuffer: position / normal / albedo+roughness.
 
-// t0 — diffuse / albedo texture
-// t1 — normal map
-// t2 — displacement / height map
+// t0 вЂ” diffuse / albedo texture
+// t1 вЂ” normal map
+// t2 вЂ” displacement / height map
 Texture2D gDiffuseMap : register(t0);
 Texture2D gNormalMap : register(t1);
 Texture2D gDisplacementMap : register(t2);
 
 SamplerState gsamLinear : register(s0);
 
-// Такой же Object CB, как в GeometryPass.hlsl
+// РўР°РєРѕР№ Р¶Рµ Object CB, РєР°Рє РІ GeometryPass.hlsl
 cbuffer cbPerObject : register(b0)
 {
     float4x4 gWorld;
@@ -19,9 +19,12 @@ cbuffer cbPerObject : register(b0)
 
     int gAnimType;
     float3 gPad;
+    float4x4 gPreviousWorld;
+    float gPreviousTime;
+    float3 gMotionPadding;
 };
 
-// Такой же Pass CB, как в GeometryPass.hlsl
+// РўР°РєРѕР№ Р¶Рµ Pass CB, РєР°Рє РІ GeometryPass.hlsl
 cbuffer cbPass : register(b1)
 {
     float4x4 gView;
@@ -45,7 +48,7 @@ cbuffer cbPass : register(b1)
     float4 gAmbientLight;
 };
 
-// Такой же Material CB
+// РўР°РєРѕР№ Р¶Рµ Material CB
 cbuffer cbMaterial : register(b2)
 {
     float4 gDiffuseAlbedo;
@@ -54,7 +57,7 @@ cbuffer cbMaterial : register(b2)
     float4x4 gMatTransform;
 };
 
-// Отдельные настройки тесселяции
+// РћС‚РґРµР»СЊРЅС‹Рµ РЅР°СЃС‚СЂРѕР№РєРё С‚РµСЃСЃРµР»СЏС†РёРё
 cbuffer cbTessellation : register(b3)
 {
     float gMinTessFactor;
@@ -102,6 +105,7 @@ struct DomainOut
     float3 PosW : POSITION;
     float3 NormalW : NORMAL;
     float2 TexC : TEXCOORD;
+    float3 PreviousPosW : TEXCOORD1;
 };
 
 struct GBufferOutput
@@ -109,6 +113,7 @@ struct GBufferOutput
     float4 Position : SV_Target0;
     float4 Normal : SV_Target1;
     float4 Albedo : SV_Target2;
+    float4 PreviousPosition : SV_Target3;
 };
 
 VertexOut VS(VertexIn vin)
@@ -122,13 +127,13 @@ VertexOut VS(VertexIn vin)
     return vout;
 }
 
-// Расчёт tessellation factor в зависимости от расстояния до камеры.
+// Р Р°СЃС‡С‘С‚ tessellation factor РІ Р·Р°РІРёСЃРёРјРѕСЃС‚Рё РѕС‚ СЂР°СЃСЃС‚РѕСЏРЅРёСЏ РґРѕ РєР°РјРµСЂС‹.
 float CalcTessFactor(float3 worldPos)
 {
     float distToEye = distance(worldPos, gEyePosW);
 
-    // Близко к камере — tessellation высокая.
-    // Далеко от камеры — tessellation низкая.
+    // Р‘Р»РёР·РєРѕ Рє РєР°РјРµСЂРµ вЂ” tessellation РІС‹СЃРѕРєР°СЏ.
+    // Р”Р°Р»РµРєРѕ РѕС‚ РєР°РјРµСЂС‹ вЂ” tessellation РЅРёР·РєР°СЏ.
     float s = saturate(
         (gMaxTessDistance - distToEye) /
         (gMaxTessDistance - gMinTessDistance)
@@ -137,7 +142,7 @@ float CalcTessFactor(float3 worldPos)
     return lerp(gMinTessFactor, gMaxTessFactor, s);
 }
 
-// Patch constant function для quad patch из 4 control points.
+// Patch constant function РґР»СЏ quad patch РёР· 4 control points.
 PatchTess ConstantHS(InputPatch<VertexOut, 4> patch, uint patchID : SV_PrimitiveID)
 {
     PatchTess pt;
@@ -186,7 +191,7 @@ DomainOut DS(PatchTess patchTess, float2 uv : SV_DomainLocation, const OutputPat
 {
     DomainOut dout;
 
-    // Bilinear interpolation по 4 control points.
+    // Bilinear interpolation РїРѕ 4 control points.
     float3 posL =
         lerp(
             lerp(patch[0].PosL, patch[1].PosL, uv.x),
@@ -214,21 +219,25 @@ DomainOut DS(PatchTess patchTess, float2 uv : SV_DomainLocation, const OutputPat
     texC = mul(texCTransformed, gMatTransform).xy;
 
     // Height/displacement.
-    // Берём значение из displacement map и двигаем вершину вдоль нормали.
+    // Р‘РµСЂС‘Рј Р·РЅР°С‡РµРЅРёРµ РёР· displacement map Рё РґРІРёРіР°РµРј РІРµСЂС€РёРЅСѓ РІРґРѕР»СЊ РЅРѕСЂРјР°Р»Рё.
     float height = gDisplacementMap.SampleLevel(gsamLinear, texC, 0.0f).r;
 
-// Displacement от карты высот.
+// Displacement РѕС‚ РєР°СЂС‚С‹ РІС‹СЃРѕС‚.
     float displacement = height * gDisplacementScale;
 
-// Анимированная волна.
-// Используем локальные координаты пола и время из cbPass.
+// РђРЅРёРјРёСЂРѕРІР°РЅРЅР°СЏ РІРѕР»РЅР°.
+// РСЃРїРѕР»СЊР·СѓРµРј Р»РѕРєР°Р»СЊРЅС‹Рµ РєРѕРѕСЂРґРёРЅР°С‚С‹ РїРѕР»Р° Рё РІСЂРµРјСЏ РёР· cbPass.
     float wave1 = sin((posL.x + gTotalTime * gWaveSpeed) * gWaveFrequency);
     float wave2 = cos((posL.z + gTotalTime * gWaveSpeed * 0.7f) * gWaveFrequency);
 
     float wave = (wave1 + wave2) * 0.5f;
 
-// Итоговое смещение: карта высот + волна.
+// РС‚РѕРіРѕРІРѕРµ СЃРјРµС‰РµРЅРёРµ: РєР°СЂС‚Р° РІС‹СЃРѕС‚ + РІРѕР»РЅР°.
     float totalDisplacement = displacement + wave * gWaveAmplitude;
+    float previousWave=(sin((posL.x+gPreviousTime*gWaveSpeed)*gWaveFrequency)+
+        cos((posL.z+gPreviousTime*gWaveSpeed*0.7f)*gWaveFrequency))*0.5f;
+    float3 previousPosL=posL+normalL*(displacement+previousWave*gWaveAmplitude);
+    dout.PreviousPosW=mul(float4(previousPosL,1),gPreviousWorld).xyz;
 
     posL += normalL * totalDisplacement;
 
@@ -243,8 +252,8 @@ DomainOut DS(PatchTess patchTess, float2 uv : SV_DomainLocation, const OutputPat
     return dout;
 }
 
-// Восстановление normal map через экранные производные.
-// Это не требует tangent в вершинах.
+// Р’РѕСЃСЃС‚Р°РЅРѕРІР»РµРЅРёРµ normal map С‡РµСЂРµР· СЌРєСЂР°РЅРЅС‹Рµ РїСЂРѕРёР·РІРѕРґРЅС‹Рµ.
+// Р­С‚Рѕ РЅРµ С‚СЂРµР±СѓРµС‚ tangent РІ РІРµСЂС€РёРЅР°С….
 float3 ApplyNormalMap(float3 normalW, float3 posW, float2 texC)
 {
     float3 normalSample = gNormalMap.Sample(gsamLinear, texC).xyz;
@@ -277,13 +286,14 @@ GBufferOutput PS(DomainOut pin)
 
     float3 N = ApplyNormalMap(pin.NormalW, pin.PosW, pin.TexC);
 
-    // RT0 — world position.
+    // RT0 вЂ” world position.
     gout.Position = float4(pin.PosW, 1.0f);
+    gout.PreviousPosition=float4(pin.PreviousPosW,1);
 
-    // RT1 — normal packed [-1,1] -> [0,1].
+    // RT1 вЂ” normal packed [-1,1] -> [0,1].
     gout.Normal = float4(N * 0.5f + 0.5f, 1.0f);
 
-    // RT2 — albedo + roughness.
+    // RT2 вЂ” albedo + roughness.
     float3 albedo = texColor.rgb * gDiffuseAlbedo.rgb;
     gout.Albedo = float4(albedo, gRoughness);
 

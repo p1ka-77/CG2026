@@ -1,6 +1,6 @@
 // GeometryPass.hlsl
-// Первый проход deferred rendering.
-// Пишет данные поверхности в GBuffer.
+// РџРµСЂРІС‹Р№ РїСЂРѕС…РѕРґ deferred rendering.
+// РџРёС€РµС‚ РґР°РЅРЅС‹Рµ РїРѕРІРµСЂС…РЅРѕСЃС‚Рё РІ GBuffer.
 
 Texture2D gDiffuseMap : register(t0);
 SamplerState gsamLinear : register(s0);
@@ -12,6 +12,9 @@ cbuffer cbPerObject : register(b0)
 
     int gAnimType;
     float3 gPad;
+    float4x4 gPreviousWorld;
+    float gPreviousTime;
+    float3 gMotionPadding;
 };
 
 cbuffer cbPass : register(b1)
@@ -58,6 +61,7 @@ struct VertexOut
     float3 PosW : POSITION;
     float3 NormalW : NORMAL;
     float2 TexC : TEXCOORD;
+    float3 PreviousPosW : TEXCOORD1;
 };
 
 struct GBufferOutput
@@ -65,6 +69,7 @@ struct GBufferOutput
     float4 Position : SV_Target0;
     float4 Normal : SV_Target1;
     float4 Albedo : SV_Target2;
+    float4 PreviousPosition : SV_Target3;
 };
 
 VertexOut VS(VertexIn vin)
@@ -72,20 +77,23 @@ VertexOut VS(VertexIn vin)
     VertexOut vout = (VertexOut) 0.0f;
 
     float3 posL = vin.PosL;
+    float3 previousPosL=vin.PosL;
 
-    // Простая вертексная анимация.
-    // Работает только если gAnimType == 1.
+    // РџСЂРѕСЃС‚Р°СЏ РІРµСЂС‚РµРєСЃРЅР°СЏ Р°РЅРёРјР°С†РёСЏ.
+    // Р Р°Р±РѕС‚Р°РµС‚ С‚РѕР»СЊРєРѕ РµСЃР»Рё gAnimType == 1.
     if (gAnimType == 1)
     {
         float hang = (vin.PosL.y + 1.0f) * 0.5f;
         float swing = sin(gTotalTime * 1.5f) * 0.08f;
 
         posL.x += swing * (1.0f - hang);
+        previousPosL.x+=sin(gPreviousTime*1.5f)*0.08f*(1.0f-hang);
     }
 
     float4 posW = mul(float4(posL, 1.0f), gWorld);
 
     vout.PosW = posW.xyz;
+    vout.PreviousPosW=mul(float4(previousPosL,1),gPreviousWorld).xyz;
     vout.PosH = mul(posW, gViewProj);
 
     vout.NormalW = mul(vin.NormalL, (float3x3) gWorld);
@@ -102,16 +110,17 @@ GBufferOutput PS(VertexOut pin)
 
     float4 texColor = gDiffuseMap.Sample(gsamLinear, pin.TexC);
 
-    // RT0 — мировая позиция.
-    // w = 1 означает, что пиксель был заполнен геометрией.
+    // RT0 вЂ” РјРёСЂРѕРІР°СЏ РїРѕР·РёС†РёСЏ.
+    // w = 1 РѕР·РЅР°С‡Р°РµС‚, С‡С‚Рѕ РїРёРєСЃРµР»СЊ Р±С‹Р» Р·Р°РїРѕР»РЅРµРЅ РіРµРѕРјРµС‚СЂРёРµР№.
     gout.Position = float4(pin.PosW, 1.0f);
+    gout.PreviousPosition=float4(pin.PreviousPosW,1);
 
-    // RT1 — нормаль.
-    // Упаковка из диапазона [-1, 1] в [0, 1].
+    // RT1 вЂ” РЅРѕСЂРјР°Р»СЊ.
+    // РЈРїР°РєРѕРІРєР° РёР· РґРёР°РїР°Р·РѕРЅР° [-1, 1] РІ [0, 1].
     float3 N = normalize(pin.NormalW);
     gout.Normal = float4(N * 0.5f + 0.5f, 1.0f);
 
-    // RT2 — цвет поверхности + roughness.
+    // RT2 вЂ” С†РІРµС‚ РїРѕРІРµСЂС…РЅРѕСЃС‚Рё + roughness.
     float3 albedo = texColor.rgb * gDiffuseAlbedo.rgb;
     gout.Albedo = float4(albedo, gRoughness);
 

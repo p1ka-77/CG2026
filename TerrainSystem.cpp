@@ -264,14 +264,14 @@ std::wstring TerrainSystem::Status() const
     std::wostringstream s;
     const wchar_t* names[]={L"Red",L"Blue",L"Green",L"Yellow",L"White",L"Black"};
     s<<L"Brush "<<(BrushEnabled?L"ON":L"OFF")<<L" [P] "<<names[BrushColor%6]<<L" [1-6] R="<<int(BrushRadius)
-        <<L"m [[]] | LMB paint / Ctrl erase / RMB look | F2 save F3 load | "
-        <<(PaintVisible?L"Paint ON":L"Paint OFF")<<L" [F4] | ";
+        <<L"m [[]] | LMB paint / Ctrl erase / RMB look | Ctrl+S save Ctrl+O load | "
+        <<(PaintVisible?L"Paint ON":L"Paint OFF")<<L" [Ctrl+P] | ";
     if(!mPaintMessage.empty()) s<<mPaintMessage<<L" | ";
-    s<<L"TERRAIN [F7] | LOD "<<(EnableLOD?L"ON":L"FULL")<<L" [F8] | Cull "<<(EnableCulling?L"ON":L"OFF")
-        <<L" [F9] | Tiles/Draws "<<mSelected.size()<<L" | Tris "<<mSelected.size()*(EnableSkirts?mIndexCount:mSurfaceIndexCount)/3
+    s<<L"TERRAIN | LOD "<<(EnableLOD?L"ON":L"FULL")<<L" [Ins] | Cull "<<(EnableCulling?L"ON":L"OFF")
+        <<L" [Del] | Tiles/Draws "<<mSelected.size()<<L" | Tris "<<mSelected.size()*(EnableSkirts?mIndexCount:mSurfaceIndexCount)/3
         <<L" | Nodes "<<mVisited<<L" | Rejected "<<mRejected<<L" | HiddenLeaves "<<mHiddenLeaves
-        <<L" | SSE "<<static_cast<int>(PixelError)<<L"px [-/+] | View [F11] | Debug [F10] | "
-        <<(FreezeSelection?L"FROZEN":L"LIVE")<<L" [F12] | Levels ";
+        <<L" | SSE "<<static_cast<int>(PixelError)<<L"px [Ctrl +/-] | View [Home] | Debug [\\] | "
+        <<(FreezeSelection?L"FROZEN":L"LIVE")<<L" [End] | Levels ";
     for(unsigned i=0;i<=mMaxDepth;++i) s<<i<<L":"<<mLevels[i]<<L" ";
     return s.str();
 }

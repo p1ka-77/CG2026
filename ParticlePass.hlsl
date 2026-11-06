@@ -14,6 +14,8 @@ struct Particle
     float2 Size;
     uint Seed;
     float Padding;
+    float3 PreviousPosition;
+    float PreviousValid;
 };
 
 cbuffer cbParticles : register(b0)
@@ -31,6 +33,10 @@ cbuffer cbParticles : register(b0)
 
     float3 gEmitterPositionW;
     uint gFrameIndex;
+    float3 gPreviousCameraRightW;
+    float gMotionPad0;
+    float3 gPreviousCameraUpW;
+    float gMotionPad1;
 };
 
 ConsumeStructuredBuffer<Particle> gConsumeParticles : register(u0);
@@ -67,6 +73,8 @@ void RespawnParticle(inout Particle particle, uint dispatchIndex)
     float size = lerp(0.32f, 0.48f, Random01(randomState));
 
     particle.Position = gEmitterPositionW;
+    particle.PreviousPosition=particle.Position;
+    particle.PreviousValid=0; // A respawn has no corresponding surface in history.
     particle.Velocity = float3(
         cos(angle) * radialSpeed,
         verticalSpeed,
@@ -93,6 +101,8 @@ void CS(uint3 dispatchThreadId : SV_DispatchThreadID)
 
     // The mandatory position update happens after Consume(), on the GPU.
     Particle particle = gConsumeParticles.Consume();
+    particle.PreviousPosition=particle.Position;
+    particle.PreviousValid=1;
 
     particle.Age += gDeltaTime;
     particle.Velocity.y -= 2.8f * gDeltaTime;
@@ -111,6 +121,7 @@ struct ParticleVertex
     float3 CenterW : POSITION;
     float4 Color : COLOR;
     float2 Size : TEXCOORD0;
+    float4 PreviousCenterW : TEXCOORD1;
 };
 
 ParticleVertex VS(uint vertexId : SV_VertexID)
@@ -119,6 +130,7 @@ ParticleVertex VS(uint vertexId : SV_VertexID)
 
     ParticleVertex output;
     output.CenterW = particle.Position;
+    output.PreviousCenterW=float4(particle.PreviousPosition,particle.PreviousValid);
     output.Color = particle.Color;
     output.Size = particle.Size;
     return output;
@@ -137,6 +149,7 @@ struct MeshVertexOut
     float3 PosW : POSITION;
     float3 NormalW : NORMAL;
     float4 Color : COLOR;
+    float4 PreviousPosW : TEXCOORD1;
 };
 
 float3 RotateParticle(float3 v, float angle)
@@ -152,6 +165,8 @@ MeshVertexOut MeshVS(MeshVertexIn input, uint instanceId : SV_InstanceID)
     float angle = particle.Age * 1.6f + (particle.Seed & 255u) * 0.02454f;
     MeshVertexOut output;
     output.PosW = RotateParticle(input.PosL * particle.Size.x, angle) + particle.Position;
+    output.PreviousPosW=float4(RotateParticle(input.PosL*particle.Size.x,angle-gDeltaTime*1.6f)+
+        particle.PreviousPosition,particle.PreviousValid);
     output.NormalW = RotateParticle(input.NormalL, angle);
     output.PosH = mul(float4(output.PosW, 1.0f), gViewProj);
     output.Color = particle.Color;
@@ -164,6 +179,7 @@ struct BillboardVertex
     float3 PosW : POSITION0;
     float4 Color : COLOR;
     float2 TexC : TEXCOORD0;
+    float4 PreviousPosW : TEXCOORD1;
 };
 
 [maxvertexcount(4)]
@@ -197,6 +213,9 @@ void GS(
 
         BillboardVertex output;
         output.PosW = positionW;
+        output.PreviousPosW=float4(input[0].PreviousCenterW.xyz+
+            gPreviousCameraRightW*cornerSigns[i].x*input[0].Size.x+
+            gPreviousCameraUpW*cornerSigns[i].y*input[0].Size.y,input[0].PreviousCenterW.w);
         output.PosH = mul(float4(positionW, 1.0f), gViewProj);
         output.Color = input[0].Color;
         output.TexC = textureCoordinates[i];
@@ -211,6 +230,7 @@ struct GBufferOutput
     float4 Position : SV_Target0;
     float4 Normal : SV_Target1;
     float4 Albedo : SV_Target2;
+    float4 PreviousPosition : SV_Target3;
 };
 
 GBufferOutput PS(BillboardVertex input)
@@ -231,6 +251,7 @@ GBufferOutput PS(BillboardVertex input)
 
     GBufferOutput output;
     output.Position = float4(input.PosW, 1.0f);
+    output.PreviousPosition=input.PreviousPosW;
     output.Normal = float4(normalW * 0.5f + 0.5f, 1.0f);
     output.Albedo = float4(
         input.Color.rgb * (0.65f + 0.35f * sphereDepth),
@@ -242,6 +263,7 @@ GBufferOutput MeshPS(MeshVertexOut input)
 {
     GBufferOutput output;
     output.Position = float4(input.PosW, 1.0f);
+    output.PreviousPosition=input.PreviousPosW;
     output.Normal = float4(normalize(input.NormalW) * 0.5f + 0.5f, 1.0f);
     output.Albedo = float4(input.Color.rgb, 0.35f);
     return output;

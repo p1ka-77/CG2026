@@ -5,6 +5,9 @@ Texture2D gSceneColor : register(t0);
 Texture2D gPosition   : register(t1);
 Texture2D gNormal     : register(t2);
 Texture2D gAlbedo     : register(t3);
+Texture2D gHistory0   : register(t4);
+Texture2D gHistory1   : register(t5);
+Texture2D<float2> gMotionVectors : register(t6);
 
 cbuffer cbPostProcess : register(b0)
 {
@@ -15,6 +18,8 @@ cbuffer cbPostProcess : register(b0)
 
     float2 gInvRenderTargetSize;
     float2 gPadding1;
+    float2 gCurrentJitter;
+    float2 gMotionDebug; // enabled, signed motion color scale in pixels
 };
 
 struct VertexOut
@@ -114,6 +119,18 @@ float4 PS(VertexOut input) : SV_Target
         dimensions - int2(1, 1));
 
     float3 color = gSceneColor.Load(int3(pixel, 0)).rgb;
+    if(gMotionDebug.x>0.5f)
+    {
+        float2 motionPixels=gMotionVectors.Load(int3(pixel,0))/gInvRenderTargetSize;
+        return float4(saturate(float3(0.5f,0.5f,0.5f)+float3(motionPixels,0)/gMotionDebug.y),1);
+    }
+    // CPU selects the resolved ping-pong history (1 or 2); zero bypasses TAA.
+    // Split comparison keeps raw color on the left and resolved color on the right.
+    bool useHistory = gPadding1.x > 0.5f &&
+        (gPadding1.y < 0.5f || input.TexC.x >= 0.5f);
+    if (useHistory)
+        color = gPadding1.x < 1.5f ? gHistory0.Load(int3(pixel, 0)).rgb :
+            gHistory1.Load(int3(pixel, 0)).rgb;
 
     // Technique 1: luminance-based grayscale.
     if (gEffectMode == 1 || gEffectMode == 3)
@@ -135,5 +152,12 @@ float4 PS(VertexOut input) : SV_Target
     centered.x *= gInvRenderTargetSize.y / gInvRenderTargetSize.x;
     float vignette = smoothstep(0.48f, 1.12f, length(centered));
     color *= 1.0f - vignette * saturate(gVignetteStrength);
+    // Fixed-width screen-space divider, drawn after effects so it stays visible.
+    if (gPadding1.x > 0.5f && gPadding1.y > 0.5f)
+    {
+        float centerDistance = abs(input.PosH.x - float(width) * 0.5f);
+        if (centerDistance < 3.0f) color = float3(0.015f, 0.015f, 0.015f);
+        if (centerDistance < 1.0f) color = float3(1.0f, 0.85f, 0.15f);
+    }
     return float4(color, 1.0f);
 }

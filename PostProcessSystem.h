@@ -21,7 +21,7 @@ struct PostProcessConstants
     XMFLOAT2 InvRenderTargetSize = { 1.0f, 1.0f };
     XMFLOAT2 Padding1 = { 0.0f, 0.0f };
     XMFLOAT2 CurrentJitter = {};
-    XMFLOAT2 Padding2 = {};
+    XMFLOAT2 MotionDebug = { 0.0f, 32.0f };
 };
 
 static_assert(sizeof(PostProcessConstants) == 48,
@@ -61,6 +61,8 @@ public:
     void ResetTAA() { mHistoryValid=false; }
     bool TAAEnabled = true;
     bool TAASplit = false;
+    bool ShowMotionVectors = false;
+    bool ShowJitteredInput = false; // Validation: raw raster samples with TAA jitter still enabled.
 
 private:
     void BuildRootSignature(ID3D12Device* device);
@@ -72,7 +74,8 @@ private:
         ID3D12DescriptorHeap* gBufferSrvHeap);
 
 private:
-    static constexpr UINT PostProcessSrvCount = 6;
+    static constexpr UINT PostProcessSrvCount = 7;
+    ComPtr<ID3D12Resource> mMotionVectors;
     ComPtr<ID3D12Resource> mHistory[2], mHistoryPosition[2];
     ComPtr<ID3D12DescriptorHeap> mTaaHeaps[2], mTaaRTVs;
     ComPtr<ID3D12RootSignature> mTaaRoot;

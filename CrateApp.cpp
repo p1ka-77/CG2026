@@ -1,4 +1,4 @@
-﻿//***************************************************************************************
+//***************************************************************************************
 // CrateApp.cpp by Frank Luna (C) 2015 All Rights Reserved.
 //***************************************************************************************
 
@@ -14,7 +14,9 @@
 #include "ParticleSystem.h"
 #include "PostProcessSystem.h"
 #include "TerrainSystem.h"
+#include "Tools/renderdoc_app.h"
 #include <cfloat>
+#include <cmath>
 #include <algorithm>
 #include <fstream>
 #include <DirectXCollision.h>
@@ -29,6 +31,12 @@ using namespace DirectX::PackedVector;
 
 const int gNumFrameResources = 3;
 
+static bool IsRoomCutawayShell(const std::string& name)
+{
+    return name == "breakfast_room_Ceiling" || name == "breakfast_room_Wall_North" ||
+        name == "breakfast_room_Wall_East" || name == "Blinds_breakfast_room";
+}
+
 // Lightweight structure stores parameters to draw a shape.  This will
 // vary from app-to-app.
 struct RenderItem
@@ -39,6 +47,9 @@ struct RenderItem
     // relative to the world space, which defines the position, orientation,
     // and scale of the object in the world.
     XMFLOAT4X4 World = MathHelper::Identity4x4();
+    XMFLOAT4X4 PreviousWorld = MathHelper::Identity4x4();
+    bool HasPreviousWorld = false;
+    bool MotionDemoBox = false;
 
 	XMFLOAT4X4 TexTransform = MathHelper::Identity4x4();
 
@@ -71,6 +82,7 @@ struct RenderItem
 	float AnimationPhase = 0.0f;
 
 	bool EnableFrustumCulling = false;
+    bool RoomCutawayShell = false;
 	BoundingBox LocalBounds;
 
 };
@@ -130,6 +142,22 @@ public:
     virtual bool Initialize()override;
     LRESULT MsgProc(HWND hwnd,UINT msg,WPARAM wParam,LPARAM lParam) override
     {
+        if (msg == WM_KEYDOWN && (GetAsyncKeyState(VK_CONTROL) & 0x8000) == 0 &&
+            (wParam == VK_OEM_PLUS || wParam == VK_ADD ||
+             wParam == VK_OEM_MINUS || wParam == VK_SUBTRACT))
+        {
+            const bool faster = wParam == VK_OEM_PLUS || wParam == VK_ADD;
+            mCameraSpeedScale = MathHelper::Clamp(
+                mCameraSpeedScale * (faster ? 1.25f : 0.8f), 0.05f, 20.0f);
+            return 0;
+        }
+        if (msg == WM_MOUSEWHEEL)
+        {
+            float steps = static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)) / WHEEL_DELTA;
+            mCameraSpeedScale = MathHelper::Clamp(mCameraSpeedScale * std::pow(1.25f, steps), 0.05f, 20.0f);
+            return 0;
+        }
+        if (msg == WM_KEYUP && wParam == VK_F2) return 0;
         // The app owns its status caption; suppress the base FPS caption overwrite.
         if(msg==WM_SETTEXT && !mTitleWritable && !mStatusTitle.empty()) return TRUE;
         return D3DApp::MsgProc(hwnd,msg,wParam,lParam);
@@ -145,6 +173,9 @@ private:
     virtual void OnMouseMove(WPARAM btnState, int x, int y)override;
 
     void OnKeyboardInput(const GameTimer& gt);
+    void ShowCombinedScene();
+    float CameraSpeed() const;
+    std::wstring CameraSpeedStatus() const;
 	void UpdateCamera(const GameTimer& gt);
 	void AnimateMaterials(const GameTimer& gt);
 	void UpdateSinusoidalAnimations(const GameTimer& gt);
@@ -246,11 +277,23 @@ private:
     float mTitleTime=-1;
     int mTaaSequenceRemaining=0;
     bool mTaaKeys[3]={};
+    bool mMotionKeys[2]={};
+    bool mMotionDemo=false;
+    float mPreviousSceneTime=0.0f;
+    float mDemoBoxTime=0.0f;
+    bool mDemoBoxPaused=false,mDemoBoxPauseKey=false;
+    float mMotionDemoTime=0.0f;
+    XMFLOAT3 mMotionDemoOrigin={};
+    RENDERDOC_API_1_6_0* mRenderDocAPI=nullptr;
+    unsigned mRenderDocFrame=0;
+    bool mRenderDocOpened=false;
     XMFLOAT3 mTaaCamera={};
     float mTaaYaw=0,mTaaPitch=0;
     int mTaaCaptureFrames=0;
     TerrainSystem mTerrain;
-    bool mTerrainMode = true;
+    bool mTerrainOverviewCamera = false;
+    bool mRoomCutaway = true;
+    bool mCutawayKeyPressed = false;
     int mTerrainCapture = -1; // Optional automated GPU readback check, never used during normal play.
     bool mTerrainKeys[7] = {};
     bool mTerrainPaintKeys[6] = {};
@@ -273,6 +316,7 @@ private:
 	float mPitch = 0.0f;
 
 	float mCameraMoveSpeed = 6.0f;
+    float mCameraSpeedScale = 1.0f;
 	float mMouseSensitivity = 0.003f;
 
     POINT mLastMousePos;
@@ -340,7 +384,7 @@ private:
     bool mShadowPatternEnabled = true;
     float mShadowPatternScale = 2.0f;
     bool mMeshParticles = true;
-    bool mVignetteEnabled = true;
+    bool mVignetteEnabled = false;
     bool mNewDemoKeysPressed[4] = {};
     bool mDemoShadowView = false;
 	std::array<ShadowPassConstants, SHADOW_CASCADE_COUNT> mShadowPassConstants = {};
@@ -396,10 +440,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance,
 CrateApp::CrateApp(HINSTANCE hInstance)
     : D3DApp(hInstance)
 {
-    // The original lab remains at the world origin, inside the terrain clearing.
-    mCameraPos = XMFLOAT3(3.0f, 3.0f, 8.0f);
-    mYaw = XM_PI;
-    mPitch = -0.15f;
+    ShowCombinedScene();
+}
+
+void CrateApp::ShowCombinedScene()
+{
+    mCameraPos = XMFLOAT3(18.0f, 12.0f, -28.0f);
+    mYaw = -0.571f; mPitch = -0.292f;
+    mTerrainOverviewCamera = false; mRoomCutaway = true;
+    mMotionDemo=false;
+    mTerrain.FreezeSelection = false;
+    mTerrain.EndStroke();
+    mPostProcessSystem.ResetTAA();
+}
+
+float CrateApp::CameraSpeed() const
+{
+    return (mTerrainOverviewCamera ? 180.0f : mCameraMoveSpeed) * mCameraSpeedScale;
+}
+
+std::wstring CrateApp::CameraSpeedStatus() const
+{
+    std::wstring speed = std::to_wstring(CameraSpeed());
+    speed.resize(speed.find(L'.') + 2);
+    return L"Speed " + speed + L" u/s [+/-/Wheel] | ";
 }
 
 CrateApp::~CrateApp()
@@ -508,14 +572,40 @@ bool CrateApp::Initialize()
 	mTexMgr.ReleaseUploadHeaps();
 	mParticleSystem.ReleaseInitializationUpload();
     mTerrain.ReleaseUploadBuffers();
+    if(strstr(GetCommandLineA(),"--renderdoc-demo")!=nullptr)
+    {
+        HMODULE module=GetModuleHandleW(L"renderdoc.dll");
+        auto getAPI=module?reinterpret_cast<pRENDERDOC_GetAPI>(GetProcAddress(module,"RENDERDOC_GetAPI")):nullptr;
+        if(!getAPI || !getAPI(eRENDERDOC_API_Version_1_6_0,reinterpret_cast<void**>(&mRenderDocAPI)))
+            throw std::runtime_error("Start the RenderDoc demo using C:\\d3d12book\\Start-RenderDoc-Demo.cmd");
+        if(!CreateDirectoryA("DemoCaptures",nullptr) && GetLastError()!=ERROR_ALREADY_EXISTS)
+            throw std::runtime_error("Cannot create DemoCaptures folder");
+        char capturePath[MAX_PATH]={};
+        std::string capturePrefix="DemoCaptures\\CG2026_"+std::to_string(GetCurrentProcessId())+"_"+std::to_string(GetTickCount64());
+        if(!GetFullPathNameA(capturePrefix.c_str(),MAX_PATH,capturePath,nullptr))
+            throw std::runtime_error("Cannot resolve capture path");
+        mRenderDocAPI->SetCaptureFilePathTemplate(capturePath);
+        RENDERDOC_InputButton captureKey=eRENDERDOC_Key_F8;
+        mRenderDocAPI->SetCaptureKeys(&captureKey,1);
+        mMotionDemo=false; // Keep the camera still to demonstrate object motion.
+        mTerrain.BrushEnabled=false;
+    }
     if (const char* capture = strstr(GetCommandLineA(), "--terrain-capture="))
     {
         mTerrainCapture = atoi(capture + strlen("--terrain-capture="));
-        if(mTerrainCapture>=30 && mTerrainCapture<=32)
+        if(mTerrainCapture>=40 && mTerrainCapture<=43)
+        {
+            mTaaCaptureFrames=40;
+            mPostProcessSystem.TAAEnabled=true;
+            mPostProcessSystem.ShowMotionVectors=mTerrainCapture!=40;
+            mParticlesEnabled=false;
+        }
+        if(mTerrainCapture>=30 && mTerrainCapture<=33)
         {
             mTaaCaptureFrames=32; mTaaSequenceRemaining=16;
             mPostProcessSystem.TAAEnabled=mTerrainCapture!=30;
             mPostProcessSystem.TAASplit=mTerrainCapture==32;
+            mPostProcessSystem.ShowJitteredInput=mTerrainCapture==33;
             mParticlesEnabled=false;
         }
         if(mTerrainCapture>=20 && mTerrainCapture<=22)
@@ -523,6 +613,14 @@ bool CrateApp::Initialize()
             mTaaCaptureFrames=32;
             mPostProcessSystem.TAAEnabled=mTerrainCapture!=20;
             mPostProcessSystem.TAASplit=mTerrainCapture==22;
+        }
+        if(mTerrainCapture==23 || mTerrainCapture==24)
+        {
+            mTaaCaptureFrames=40;
+            mPostProcessSystem.ShowMotionVectors=true;
+            mParticlesEnabled=false;
+            mMotionDemo=mTerrainCapture==24;
+            mMotionDemoOrigin=mCameraPos; mMotionDemoTime=0;
         }
         mTerrain.DebugMode = mTerrainCapture == 1 ? 1 : mTerrainCapture == 2 ? 2 : 0;
         if (mTerrainCapture <= 2 || mTerrainCapture == 4)
@@ -532,9 +630,8 @@ bool CrateApp::Initialize()
         { mCameraPos=XMFLOAT3(0,18,-38); mYaw=0; mPitch=-0.32f; }
         if (mTerrainCapture == 3)
         {
-            mTerrainMode = false;
+            mTerrainOverviewCamera = false;
             mCameraPos = mOtherCameraPos; mYaw = mOtherYaw; mPitch = mOtherPitch;
-            XMStoreFloat4x4(&mProj,XMMatrixPerspectiveFovLH(0.25f*MathHelper::Pi,AspectRatio(),1,1000));
         }
         if (mTerrainCapture == 4) {mTerrain.EnableLOD=false; mTerrain.DebugMode=1;}
         if (mTerrainCapture == 5) {mCameraPos=XMFLOAT3(0,1500,-2600); mYaw=0; mPitch=-0.48f; mTerrain.DebugMode=1;}
@@ -568,8 +665,8 @@ void CrateApp::OnResize()
 	XMMATRIX P = XMMatrixPerspectiveFovLH(
 		0.25f * MathHelper::Pi,
 		AspectRatio(),
-		mTerrainMode ? 0.5f : 1.0f,
-		mTerrainMode ? 12000.0f : 1000.0f);
+		0.5f,
+		12000.0f);
 
 	XMStoreFloat4x4(&mProj, P);
 
@@ -597,12 +694,23 @@ void CrateApp::Update(const GameTimer& gt)
 	//memcpy(mUVAnimCBMapped, &data, sizeof(UVAnimCB));
 
 	OnKeyboardInput(gt);
+    const bool boxPauseKey=(GetAsyncKeyState(VK_SPACE)&0x8000)!=0;
+    if(boxPauseKey && !mDemoBoxPauseKey) mDemoBoxPaused=!mDemoBoxPaused;
+    mDemoBoxPauseKey=boxPauseKey;
+    if(!mDemoBoxPaused) mDemoBoxTime+=gt.DeltaTime();
+    if(mTerrainCapture>=40 && mTerrainCapture<=43)
+        mDemoBoxTime=(mTerrainCapture==42?2.6f:0.0f)+(mTerrainCapture==43?0.7f:mTaaFrame/60.0f);
+	if(mMotionDemo)
+    {
+        mMotionDemoTime+=gt.DeltaTime();
+        mCameraPos.x=mMotionDemoOrigin.x+8.0f*std::sin(mMotionDemoTime*0.6f);
+    }
 	UpdateCamera(gt);
     const float cameraJump=fabsf(mCameraPos.x-mTaaCamera.x)+fabsf(mCameraPos.y-mTaaCamera.y)+fabsf(mCameraPos.z-mTaaCamera.z);
     if(cameraJump>30 || fabsf(mYaw-mTaaYaw)>0.8f || fabsf(mPitch-mTaaPitch)>0.8f)
         mPostProcessSystem.ResetTAA();
     mTaaCamera=mCameraPos; mTaaYaw=mYaw; mTaaPitch=mPitch;
-    XMMATRIX projection=XMMatrixPerspectiveFovLH(0.25f*MathHelper::Pi,AspectRatio(),mTerrainMode?0.5f:1.0f,mTerrainMode?12000.0f:1000.0f);
+    XMMATRIX projection=XMMatrixPerspectiveFovLH(0.25f*MathHelper::Pi,AspectRatio(),0.5f,12000.0f);
     XMStoreFloat4x4(&mProj,projection);
     mStableProj=mProj; mTaaJitter={};
     if(mPostProcessSystem.TAAEnabled)
@@ -638,20 +746,22 @@ void CrateApp::Update(const GameTimer& gt)
 	UpdateTessellationCB(gt);
 	UpdateVisibleObjects();
 
-    if (mTerrainMode)
     {
-        mTerrain.Select(XMLoadFloat4x4(&mView), XMLoadFloat4x4(&mProj), static_cast<float>(mClientHeight));
+        mTerrain.Select(XMLoadFloat4x4(&mView), XMLoadFloat4x4(&mStableProj), static_cast<float>(mClientHeight));
         POINT cursor={-1,-1};
         const bool focused=GetForegroundWindow()==mhMainWnd;
         if(focused && GetCursorPos(&cursor)) ScreenToClient(mhMainWnd,&cursor);
         const bool rotating=(GetAsyncKeyState(VK_RBUTTON)&0x8000)!=0;
         if(mTerrainCapture==9) {cursor.x=mClientWidth/2; cursor.y=mClientHeight/2;}
-        mTerrain.UpdateBrush(XMLoadFloat4x4(&mView),XMLoadFloat4x4(&mProj),mClientWidth,mClientHeight,
+        mTerrain.UpdateBrush(XMLoadFloat4x4(&mView),XMLoadFloat4x4(&mStableProj),mClientWidth,mClientHeight,
             cursor.x,cursor.y,mTerrainCapture==9 || (focused && !rotating && (GetAsyncKeyState(VK_LBUTTON)&0x8000)!=0),
             (GetAsyncKeyState(VK_CONTROL)&0x8000)!=0,gt.DeltaTime());
         std::wstring taa=mPostProcessSystem.TAAEnabled?L"TAA ON":L"TAA OFF";
         if(mPostProcessSystem.TAASplit) taa+=L" | LEFT RAW / RIGHT TAA";
-        mStatusTitle=taa+L" [F1] Split [Tab] Reset [Delete] | Home: room | " + mTerrain.Status();
+        mStatusTitle=std::wstring(mPostProcessSystem.ShowMotionVectors?L"MOTION VIEW [V] | ":L"Scene [V: motion] | ")
+            +(mMotionDemo?L"Auto camera ON [F] | ":L"Auto camera [F] | ")
+            +CameraSpeedStatus()+taa+L" [T] Split [Y] Reset [R] | Together [Tab] | "
+            +mTerrain.Status()+L" | "+mStatusTitle;
     }
     if(gt.TotalTime()-mTitleTime>=0.25f)
     {
@@ -669,7 +779,7 @@ void CrateApp::Draw(const GameTimer& gt)
 
 	// PSO можно передать nullptr, потому что нужные PSO выставит RenderingSystem.
 	ThrowIfFailed(mCommandList->Reset(cmdListAlloc.Get(), nullptr));
-    if(mTerrainMode) mTerrain.UploadPaint(mCommandList.Get(),mCurrFrameResourceIndex);
+    mTerrain.UploadPaint(mCommandList.Get(),mCurrFrameResourceIndex);
 
 	if (mParticlesEnabled)
 	{
@@ -762,8 +872,7 @@ void CrateApp::Draw(const GameTimer& gt)
 
     // Terrain changes the root signature/PSO/heap, so draw it after the scene.
     // The same depth buffer gives correct occlusion between room and landscape.
-    if (mTerrainMode)
-        mTerrain.Draw(mCommandList.Get(),XMLoadFloat4x4(&mView)*XMLoadFloat4x4(&mProj));
+    mTerrain.Draw(mCommandList.Get(),XMLoadFloat4x4(&mView)*XMLoadFloat4x4(&mProj));
 	// Переводим GBuffer из RENDER_TARGET в PIXEL_SHADER_RESOURCE.
 	mRenderSys.EndGeometryPass(mCommandList.Get());
 
@@ -790,7 +899,7 @@ void CrateApp::Draw(const GameTimer& gt)
 		nullptr
 	);
 
-    mRenderSys.SetShadowPattern(mShadowPatternEnabled && !mTerrainMode, mShadowPatternScale);
+    mRenderSys.SetShadowPattern(mShadowPatternEnabled, mShadowPatternScale);
     D3D12_CPU_DESCRIPTOR_HANDLE lightingTarget = CurrentBackBufferView();
     // Capture lit color for the common TAA/final post-processing path.
     {
@@ -805,7 +914,7 @@ void CrateApp::Draw(const GameTimer& gt)
 		mScreenViewport,
 		mScissorRect,
 		mEyePos,
-		mTerrainMode ? XMFLOAT4(0.28f,0.32f,0.38f,1.0f) : XMFLOAT4(0.05f, 0.05f, 0.05f, 1.0f)
+		XMFLOAT4(0.12f,0.14f,0.17f,1.0f)
 	);
 
     {
@@ -816,9 +925,9 @@ void CrateApp::Draw(const GameTimer& gt)
             CurrentBackBufferView(),
             mScreenViewport,
             mScissorRect,
-            mPostProcessEnabled && !mTerrainMode ? mPostProcessMode : 0,
-            mPostProcessEnabled && !mTerrainMode ? mPostProcessStrength : 0,
-            mVignetteEnabled && mPostProcessEnabled && !mTerrainMode);
+            mPostProcessEnabled ? mPostProcessMode : 0,
+            mPostProcessEnabled ? mPostProcessStrength : 0,
+            mVignetteEnabled && mPostProcessEnabled);
     }
 
 
@@ -885,6 +994,24 @@ void CrateApp::Draw(const GameTimer& gt)
 
 	mCurrFrameResource->Fence = ++mCurrentFence;
 	mCommandQueue->Signal(mFence.Get(), mCurrentFence);
+    if(mRenderDocAPI)
+    {
+        if(++mRenderDocFrame==90) mRenderDocAPI->TriggerCapture();
+        if(!mRenderDocOpened && mRenderDocAPI->GetNumCaptures()>0)
+        {
+            uint32_t size=0;
+            mRenderDocAPI->GetCapture(0,nullptr,&size,nullptr);
+            std::vector<char> filename(size+1,0);
+            if(mRenderDocAPI->GetCapture(0,filename.data(),&size,nullptr))
+            {
+                mRenderDocAPI->SetCaptureFileComments(filename.data(),
+                    "CG2026 demo: MotionVectors RG are backward camera and object motion in UV. GBuffer MRT3 stores previous surface positions. V: motion view, Space: pause box, F: camera pan, Y: TAA split.");
+                std::string command=std::string("\"")+filename.data()+"\"";
+                mRenderDocOpened=true;
+                mRenderDocAPI->LaunchReplayUI(0,command.c_str());
+            }
+        }
+    }
 }
 
 void CrateApp::OnMouseDown(WPARAM btnState, int x, int y)
@@ -903,7 +1030,7 @@ void CrateApp::OnMouseUp(WPARAM btnState, int x, int y)
 
 void CrateApp::OnMouseMove(WPARAM btnState, int x, int y)
 {
-	if ((btnState & (mTerrainMode && mTerrain.BrushEnabled ? MK_RBUTTON : MK_LBUTTON)) != 0)
+	if ((btnState & (mTerrain.BrushEnabled ? MK_RBUTTON : MK_LBUTTON)) != 0)
 	{
 		float dx = static_cast<float>(x - mLastMousePos.x);
 		float dy = static_cast<float>(y - mLastMousePos.y);
@@ -950,6 +1077,22 @@ void CrateApp::BuildScatterObjects()
 	const float startZ = -((gridZ - 1) * spacing) * 0.5f;
 
 	UINT nextObjIndex = (UINT)mAllRitems.size();
+
+    // In front of the initial camera, outside the room: always visible on Tab.
+    {
+        auto box=std::make_unique<RenderItem>();
+        box->MotionDemoBox=true;
+        XMStoreFloat4x4(&box->World,XMMatrixScaling(2.5f,2.5f,2.5f)*XMMatrixTranslation(11.77f,8.55f,-18.3f));
+        box->ObjCBIndex=nextObjIndex++;
+        box->Mat=mMaterials["woodCrate"].get();
+        box->Geo=mGeometries["boxGeo"].get();
+        auto sub=box->Geo->DrawArgs["box"];
+        box->IndexCount=sub.IndexCount;
+        box->StartIndexLocation=sub.StartIndexLocation;
+        box->BaseVertexLocation=sub.BaseVertexLocation;
+        mOpaqueRitems.push_back(box.get());
+        mAllRitems.push_back(std::move(box));
+    }
 
 	// Отдельная матовая платформа непосредственно под ящиками.
 	// Верхняя грань находится на Y=0.15 — в нижней точке анимации
@@ -1298,16 +1441,16 @@ void CrateApp::UpdateVisibleObjects()
 		title += L" | Visible: " + std::to_wstring(mNumVisibleObjects);
 		title += L" | Culled: " + std::to_wstring(mNumCulledObjects);
 		title += mAnimationLodDemoMode
-			? L" | AnimLOD: DEMO 1/8/30 [8]"
-			: L" | AnimLOD: NORMAL 1/2/4 [8]";
+			? L" | AnimLOD: DEMO 1/8/30 [Shift+8]"
+			: L" | AnimLOD: NORMAL 1/2/4 [Shift+8]";
 		title += mShadowsEnabled
-			? L" | CSM: ON [9]"
-			: L" | CSM: OFF [9]";
+			? L" | CSM: ON [Shift+9]"
+			: L" | CSM: OFF [Shift+9]";
 		if (mVisualizeShadowCascades)
-			title += L" | Cascades: DEBUG [0]";
+			title += L" | Cascades: DEBUG [Shift+0]";
 		title += mParticlesEnabled
-			? L" | Particles: ON [4]"
-			: L" | Particles: OFF [4]";
+			? L" | Particles: ON [Shift+4]"
+			: L" | Particles: OFF [Shift+4]";
         AppendPostProcessStatus(title);
 
 		mStatusTitle=title;
@@ -1377,16 +1520,16 @@ void CrateApp::UpdateVisibleObjects()
 	}
 
 	title += mAnimationLodDemoMode
-		? L" | AnimLOD: DEMO 1/8/30 [8]"
-		: L" | AnimLOD: NORMAL 1/2/4 [8]";
+		? L" | AnimLOD: DEMO 1/8/30 [Shift+8]"
+		: L" | AnimLOD: NORMAL 1/2/4 [Shift+8]";
 	title += mShadowsEnabled
-		? L" | CSM: ON [9]"
-		: L" | CSM: OFF [9]";
+		? L" | CSM: ON [Shift+9]"
+		: L" | CSM: OFF [Shift+9]";
 	if (mVisualizeShadowCascades)
-		title += L" | Cascades: DEBUG [0]";
+		title += L" | Cascades: DEBUG [Shift+0]";
 	title += mParticlesEnabled
-		? L" | Particles: ON [4]"
-		: L" | Particles: OFF [4]";
+		? L" | Particles: ON [Shift+4]"
+		: L" | Particles: OFF [Shift+4]";
     AppendPostProcessStatus(title);
 
 	mStatusTitle=title;
@@ -1394,14 +1537,14 @@ void CrateApp::UpdateVisibleObjects()
 
 void CrateApp::AppendPostProcessStatus(std::wstring& title) const
 {
-    title=(mPostProcessSystem.TAAEnabled?L"TAA ON [F1] | ":L"TAA OFF [F1] | ")+title;
     // Put the new controls FIRST so they remain visible in a narrow title bar.
-    title = std::wstring(mShadowPatternEnabled ? L"Skulls ON" : L"Skulls OFF") + L" [F3, [/]] | "
-        + (mMeshParticles ? L"Teapots" : L"Spheres") + L" [F4] | Vignette "
-        + (mVignetteEnabled && mPostProcessEnabled ? L"ON" : L"OFF") + L" [F5] | Views [F6] | " + title;
+    title = std::wstring(mShadowPatternEnabled ? L"Skulls ON" : L"Skulls OFF") + L" [;] | "
+        + (mMeshParticles ? L"Teapots" : L"Spheres") + L" [,] | Vignette "
+        + (mVignetteEnabled && mPostProcessEnabled ? L"ON" : L"OFF") + L" [.] | Close [Backspace] | "
+        + (mRoomCutaway ? L"Open room [/] | " : L"Closed room [/] | ") + title;
     if (!mPostProcessEnabled)
     {
-        title += L" | PostFX: OFF [5]";
+        title += L" | PostFX: OFF [Shift+5]";
         return;
     }
 
@@ -1413,7 +1556,7 @@ void CrateApp::AppendPostProcessStatus(std::wstring& title) const
 
     title += L" | PostFX: ";
     title += modeName;
-    title += L" [5/B]";
+    title += L" [Shift+5/B]";
     title += L" | FX: " + std::to_wstring(
         static_cast<int>(mPostProcessStrength * 100.0f + 0.5f));
     title += L"% [N/M]";
@@ -1422,10 +1565,36 @@ void CrateApp::AppendPostProcessStatus(std::wstring& title) const
 void CrateApp::OnKeyboardInput(const GameTimer& gt)
 {
     if(GetForegroundWindow()!=mhMainWnd) return;
-    const int taaKeys[]={VK_F1,VK_TAB,VK_DELETE};
+    const bool ctrl=(GetAsyncKeyState(VK_CONTROL)&0x8000)!=0;
+    const bool shift=(GetAsyncKeyState(VK_SHIFT)&0x8000)!=0;
+    const int motionKeys[]={'V','F'};
+    for(unsigned i=0;i<2;++i)
+    {
+        bool down=!ctrl && !shift && (GetAsyncKeyState(motionKeys[i])&0x8000)!=0;
+        if(down && !mMotionKeys[i])
+        {
+            if(i==0)
+            {
+                mPostProcessSystem.ShowMotionVectors=!mPostProcessSystem.ShowMotionVectors;
+                if(mPostProcessSystem.ShowMotionVectors) mPostProcessSystem.TAAEnabled=true;
+                mPostProcessSystem.ResetTAA();
+            }
+            else
+            {
+                mMotionDemo=!mMotionDemo;
+                mMotionDemoOrigin=mCameraPos; mMotionDemoTime=0;
+                if(mMotionDemo) {mTerrain.EndStroke(); mTerrain.BrushEnabled=false;}
+            }
+        }
+        mMotionKeys[i]=down;
+    }
+    if(mMotionDemo && ((GetAsyncKeyState('W')|GetAsyncKeyState('A')|
+        GetAsyncKeyState('S')|GetAsyncKeyState('D')|GetAsyncKeyState('Q')|GetAsyncKeyState('E'))&0x8000))
+        mMotionDemo=false;
+    const int taaKeys[]={'T','Y','R'};
     for(UINT i=0;i<3;++i)
     {
-        bool down=(GetAsyncKeyState(taaKeys[i])&0x8000)!=0;
+        bool down=!ctrl && !shift && (GetAsyncKeyState(taaKeys[i])&0x8000)!=0;
         if(down && !mTaaKeys[i])
         {
             if(i==0) mPostProcessSystem.TAAEnabled=!mPostProcessSystem.TAAEnabled;
@@ -1434,31 +1603,26 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
         }
         mTaaKeys[i]=down;
     }
-    bool terrainToggle = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+    bool terrainToggle = (GetAsyncKeyState(VK_TAB) & 0x8000) != 0;
     if (terrainToggle && !mTerrainKeys[0])
     {
-        mTerrainMode = !mTerrainMode;
-        mPostProcessSystem.ResetTAA();
-        std::swap(mCameraPos,mOtherCameraPos);
-        std::swap(mYaw,mOtherYaw);
-        std::swap(mPitch,mOtherPitch);
-        mTerrain.FreezeSelection = false;
-        mTerrain.EndStroke();
-        XMStoreFloat4x4(&mProj,XMMatrixPerspectiveFovLH(0.25f*MathHelper::Pi,AspectRatio(),
-            mTerrainMode?0.5f:1.0f,mTerrainMode?12000.0f:1000.0f));
+        ShowCombinedScene();
     }
     mTerrainKeys[0] = terrainToggle;
+    bool cutawayDown=(GetAsyncKeyState(VK_OEM_2)&0x8000)!=0;
+    if(cutawayDown && !mCutawayKeyPressed) {mRoomCutaway=!mRoomCutaway; mPostProcessSystem.ResetTAA();}
+    mCutawayKeyPressed=cutawayDown;
 	const float moveSpeed = 4.0f * gt.DeltaTime();
 	const float rangeSpeed = 10.0f * gt.DeltaTime();
 
 	// Выбор источника света.
-	if (!mTerrainMode && (GetAsyncKeyState('1') & 0x8000))
+	if (shift && !ctrl && (GetAsyncKeyState('1') & 0x8000))
 		mSelectedDemoLight = 1;
 
-	if (!mTerrainMode && (GetAsyncKeyState('2') & 0x8000))
+	if (shift && !ctrl && (GetAsyncKeyState('2') & 0x8000))
 		mSelectedDemoLight = 2;
 
-	if (!mTerrainMode && (GetAsyncKeyState('3') & 0x8000))
+	if (shift && !ctrl && (GetAsyncKeyState('3') & 0x8000))
 		mSelectedDemoLight = 3;
 
 	XMFLOAT3* selectedPos = nullptr;
@@ -1486,11 +1650,7 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 
 	float dt = gt.DeltaTime();
 
-    // Room-scale navigation near the origin, fast flight out over the mountains.
-    const float distanceFromRoom = sqrtf(mCameraPos.x*mCameraPos.x +
-        mCameraPos.y*mCameraPos.y + mCameraPos.z*mCameraPos.z);
-    const float flightBlend = MathHelper::Clamp((distanceFromRoom-25.0f)/125.0f,0.0f,1.0f);
-	float cameraMoveSpeed = (mTerrainMode ? mCameraMoveSpeed+(180.0f-mCameraMoveSpeed)*flightBlend : mCameraMoveSpeed) * dt;
+	float cameraMoveSpeed = CameraSpeed() * dt;
 
 	if (GetAsyncKeyState(VK_SHIFT) & 0x8000)
 		cameraMoveSpeed *= 3.0f;
@@ -1518,7 +1678,7 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 	if (GetAsyncKeyState('W') & 0x8000)
 		pos = XMVectorAdd(pos, XMVectorScale(forward, cameraMoveSpeed));
 
-	if (GetAsyncKeyState('S') & 0x8000)
+	if (!ctrl && (GetAsyncKeyState('S') & 0x8000))
 		pos = XMVectorSubtract(pos, XMVectorScale(forward, cameraMoveSpeed));
 
 	if (GetAsyncKeyState('D') & 0x8000)
@@ -1535,19 +1695,12 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 
 	XMStoreFloat3(&mCameraPos, pos);
 
-    if (mTerrainMode)
     {
-        if (GetAsyncKeyState(VK_HOME)&0x8000)
-        {
-            mTerrain.EndStroke(); mTerrain.FreezeSelection=false;
-            mCameraPos=XMFLOAT3(3,3,8); mYaw=XM_PI; mPitch=-0.15f;
-        }
-        const bool ctrl=(GetAsyncKeyState(VK_CONTROL)&0x8000)!=0;
-        const int paintKeys[]={'P',VK_F2,VK_F3,'Z','Y',VK_F4};
+        const int paintKeys[]={'P','S','O','Z','Y','P'};
         for(unsigned k=0;k<6;++k)
         {
             bool down=(GetAsyncKeyState(paintKeys[k])&0x8000)!=0;
-            if(k==3 || k==4) down=down && ctrl;
+            down=down && (k==0 ? !ctrl : ctrl);
             if(down && !mTerrainPaintKeys[k])
             {
                 mTerrain.EndStroke();
@@ -1565,11 +1718,12 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
             mTerrainPaintKeys[k]=down;
         }
         for(unsigned color=0;color<6;++color)
-            if(GetAsyncKeyState('1'+color)&0x8000) mTerrain.BrushColor=color;
-        if(GetAsyncKeyState(VK_OEM_4)&0x8000) mTerrain.BrushRadius-=80*dt;
-        if(GetAsyncKeyState(VK_OEM_6)&0x8000) mTerrain.BrushRadius+=80*dt;
+            if(!shift && ((GetAsyncKeyState(VK_NUMPAD1+color)&0x8000) ||
+                (GetAsyncKeyState('1'+color)&0x8000))) mTerrain.BrushColor=color;
+        if(mTerrain.BrushEnabled && (GetAsyncKeyState(VK_OEM_4)&0x8000)) mTerrain.BrushRadius-=80*dt;
+        if(mTerrain.BrushEnabled && (GetAsyncKeyState(VK_OEM_6)&0x8000)) mTerrain.BrushRadius+=80*dt;
         mTerrain.BrushRadius=MathHelper::Clamp(mTerrain.BrushRadius,8.0f,300.0f);
-        const int keys[] = {VK_F8,VK_F9,VK_F10,VK_F11,VK_F12,'L'};
+        const int keys[] = {VK_INSERT,VK_DELETE,VK_OEM_5,VK_HOME,VK_END,'L'};
         for(unsigned k=0;k<6;++k)
         {
             bool down=(GetAsyncKeyState(keys[k])&0x8000)!=0;
@@ -1581,6 +1735,9 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
                 if(k==3)
                 {
                     mTerrain.EndStroke();
+                    mTerrainOverviewCamera=true;
+                    mMotionDemo=false;
+                    mPostProcessSystem.ResetTAA();
                     mTerrainCameraPreset=(mTerrainCameraPreset+1)%3;
                     const XMFLOAT3 cameras[]={XMFLOAT3(0,450,-1500),XMFLOAT3(-250,240,-700),XMFLOAT3(0,1500,-2600)};
                     const float pitches[]={-0.2f,-0.12f,-0.48f};
@@ -1591,13 +1748,14 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
             }
             mTerrainKeys[k+1]=down;
         }
-        if(GetAsyncKeyState(VK_OEM_MINUS)&0x8000) {mTerrain.PixelError-=10*dt; mTerrain.FreezeSelection=false;}
-        if(GetAsyncKeyState(VK_OEM_PLUS)&0x8000) {mTerrain.PixelError+=10*dt; mTerrain.FreezeSelection=false;}
+        if(ctrl && ((GetAsyncKeyState(VK_OEM_MINUS)|GetAsyncKeyState(VK_SUBTRACT))&0x8000))
+            {mTerrain.PixelError-=10*dt; mTerrain.FreezeSelection=false;}
+        if(ctrl && ((GetAsyncKeyState(VK_OEM_PLUS)|GetAsyncKeyState(VK_ADD))&0x8000))
+            {mTerrain.PixelError+=10*dt; mTerrain.FreezeSelection=false;}
         mTerrain.PixelError=MathHelper::Clamp(mTerrain.PixelError,1.0f,80.0f);
-        return;
     }
 
-	if (selectedStrength != nullptr)
+	if (selectedStrength != nullptr && !ctrl)
 	{
 		// Быстрая смена цвета.
 		if (GetAsyncKeyState('Z') & 0x8000)
@@ -1609,11 +1767,11 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 		if (GetAsyncKeyState('C') & 0x8000)
 			*selectedStrength = XMFLOAT3(0.3f, 2.0f, 0.4f); // зелёный
 
-		if (GetAsyncKeyState('V') & 0x8000)
+		if (shift && (GetAsyncKeyState('V') & 0x8000))
 			*selectedStrength = XMFLOAT3(2.0f, 1.7f, 0.8f); // жёлто-белый
 	}
 
-	if (selectedRange != nullptr)
+	if (selectedRange != nullptr && !ctrl && !mTerrain.BrushEnabled)
 	{
 		if (GetAsyncKeyState('O') & 0x8000)
 			*selectedRange -= rangeSpeed;
@@ -1626,23 +1784,23 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 	}
 
 	// Цвет будущего "выстрела".
-	if (GetAsyncKeyState('Z') & 0x8000)
+	if (!ctrl && (GetAsyncKeyState('Z') & 0x8000))
 		mPaintColor = XMFLOAT3(2.0f, 0.4f, 0.2f); // красно-оранжевый
 
-	if (GetAsyncKeyState('X') & 0x8000)
+	if (!ctrl && (GetAsyncKeyState('X') & 0x8000))
 		mPaintColor = XMFLOAT3(0.2f, 0.5f, 2.0f); // синий
 
-	if (GetAsyncKeyState('C') & 0x8000)
+	if (!ctrl && (GetAsyncKeyState('C') & 0x8000))
 		mPaintColor = XMFLOAT3(0.3f, 2.0f, 0.4f); // зелёный
 
-	if (GetAsyncKeyState('V') & 0x8000)
+	if (shift && !ctrl && (GetAsyncKeyState('V') & 0x8000))
 		mPaintColor = XMFLOAT3(2.0f, 1.7f, 0.8f); // жёлто-белый
 
 	// Радиус будущего пятна.
-	if (GetAsyncKeyState('O') & 0x8000)
+	if (!ctrl && !mTerrain.BrushEnabled && (GetAsyncKeyState('O') & 0x8000))
 		mPaintRange -= rangeSpeed;
 
-	if (GetAsyncKeyState('P') & 0x8000)
+	if (!ctrl && !mTerrain.BrushEnabled && (GetAsyncKeyState('P') & 0x8000))
 		mPaintRange += rangeSpeed;
 
 	if (mPaintRange < 1.0f)
@@ -1652,7 +1810,7 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 		mPaintRange = 20.0f;
 
 	// 6 — включить/выключить frustum culling.
-	bool key6Down = (GetAsyncKeyState('6') & 0x8000) != 0;
+	bool key6Down = shift && !ctrl && (GetAsyncKeyState('6') & 0x8000) != 0;
 
 	if (key6Down && !mCullingToggleKeyPressed)
 	{
@@ -1663,7 +1821,7 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 
 
 	// 7 — переключить режим culling: Linear / Octree.
-	bool key7Down = (GetAsyncKeyState('7') & 0x8000) != 0;
+	bool key7Down = shift && !ctrl && (GetAsyncKeyState('7') & 0x8000) != 0;
 
 	if (key7Down && !mOctreeToggleKeyPressed)
 	{
@@ -1673,7 +1831,7 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 	mOctreeToggleKeyPressed = key7Down;
 
 	// 8 — обычный Animation LOD или усиленный режим для демонстрации.
-	bool key8Down = (GetAsyncKeyState('8') & 0x8000) != 0;
+	bool key8Down = shift && !ctrl && (GetAsyncKeyState('8') & 0x8000) != 0;
 
 	if (key8Down && !mAnimationLodToggleKeyPressed)
 	{
@@ -1683,7 +1841,7 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 	mAnimationLodToggleKeyPressed = key8Down;
 
 	// 9 — включить/выключить каскадные тени.
-	bool key9Down = (GetAsyncKeyState('9') & 0x8000) != 0;
+	bool key9Down = shift && !ctrl && (GetAsyncKeyState('9') & 0x8000) != 0;
 
 	if (key9Down && !mShadowsToggleKeyPressed)
 	{
@@ -1693,7 +1851,7 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 	mShadowsToggleKeyPressed = key9Down;
 
 	// 0 — цветная визуализация границ каскадов.
-	bool key0Down = (GetAsyncKeyState('0') & 0x8000) != 0;
+	bool key0Down = shift && !ctrl && (GetAsyncKeyState('0') & 0x8000) != 0;
 
 	if (key0Down && !mCascadeDebugToggleKeyPressed)
 	{
@@ -1703,7 +1861,7 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 	mCascadeDebugToggleKeyPressed = key0Down;
 
 	// 4 — включить/выключить GPU particle system.
-	bool key4Down = (GetAsyncKeyState('4') & 0x8000) != 0;
+	bool key4Down = shift && !ctrl && (GetAsyncKeyState('4') & 0x8000) != 0;
 
 	if (key4Down && !mParticlesToggleKeyPressed)
 	{
@@ -1713,7 +1871,7 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
 	mParticlesToggleKeyPressed = key4Down;
 
     // 5 - completely bypass/enable the final post-processing pass.
-    bool key5Down = (GetAsyncKeyState('5') & 0x8000) != 0;
+    bool key5Down = shift && !ctrl && (GetAsyncKeyState('5') & 0x8000) != 0;
     if (key5Down && !mPostProcessToggleKeyPressed)
     {
         mPostProcessEnabled = !mPostProcessEnabled;
@@ -1728,10 +1886,11 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
     }
     mPostProcessCycleKeyPressed = keyBDown;
 
-    const int demoKeys[4] = { VK_F3, VK_F4, VK_F5, VK_F6 };
+    const int demoKeys[4] = { VK_OEM_1, VK_OEM_COMMA, VK_OEM_PERIOD, VK_BACK };
     for (int k = 0; k < 4; ++k)
     {
         bool down = (GetAsyncKeyState(demoKeys[k]) & 0x8000) != 0;
+        if(k==3) down=down && !ctrl;
         if (down && !mNewDemoKeysPressed[k])
         {
             if (k == 0)
@@ -1747,6 +1906,9 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
             }
             if (k == 3)
             {
+                mTerrainOverviewCamera=false;
+                mMotionDemo=false;
+                mTerrain.EndStroke(); mPostProcessSystem.ResetTAA();
                 // First press: close fountain view. Second: boxes and patterned shadows.
                 mCameraPos = mDemoShadowView ? XMFLOAT3(5.5f, 5.0f, -10.0f) : XMFLOAT3(0.0f, 3.4f, -11.0f);
                 mYaw = mDemoShadowView ? -0.45f : 0.0f;
@@ -1762,8 +1924,8 @@ void CrateApp::OnKeyboardInput(const GameTimer& gt)
         mNewDemoKeysPressed[k] = down;
     }
     mParticleSystem.SetMeshParticles(mMeshParticles);
-    if (GetAsyncKeyState(VK_OEM_4) & 0x8000) mShadowPatternScale -= gt.DeltaTime();
-    if (GetAsyncKeyState(VK_OEM_6) & 0x8000) mShadowPatternScale += gt.DeltaTime();
+    if (!mTerrain.BrushEnabled && (GetAsyncKeyState(VK_OEM_4) & 0x8000)) mShadowPatternScale -= gt.DeltaTime();
+    if (!mTerrain.BrushEnabled && (GetAsyncKeyState(VK_OEM_6) & 0x8000)) mShadowPatternScale += gt.DeltaTime();
     mShadowPatternScale = MathHelper::Clamp(mShadowPatternScale, 0.5f, 8.0f);
 
     // N/M - smoothly decrease/increase the effect strength.
@@ -2040,6 +2202,8 @@ void CrateApp::BuildTessellationPSO()
 
 void CrateApp::UpdateTessellationCB(const GameTimer& gt)
 {
+	const bool waveControls=(GetAsyncKeyState(VK_SHIFT)&0x8000)!=0 &&
+        (GetAsyncKeyState(VK_CONTROL)&0x8000)==0;
 	// Клавиши для демонстрации.
 	// I / K — увеличить / уменьшить силу displacement.
 	if (GetAsyncKeyState('I') & 0x8000)
@@ -2068,10 +2232,10 @@ void CrateApp::UpdateTessellationCB(const GameTimer& gt)
 		mTessCB.MaxTessFactor = 16.0f;
 
 	// Y / H — амплитуда волн.
-	if (GetAsyncKeyState('Y') & 0x8000)
+	if (waveControls && (GetAsyncKeyState('Y') & 0x8000))
 		mTessCB.WaveAmplitude += 0.2f * gt.DeltaTime();
 
-	if (GetAsyncKeyState('H') & 0x8000)
+	if (waveControls && (GetAsyncKeyState('H') & 0x8000))
 		mTessCB.WaveAmplitude -= 0.2f * gt.DeltaTime();
 
 	if (mTessCB.WaveAmplitude < 0.0f)
@@ -2082,10 +2246,10 @@ void CrateApp::UpdateTessellationCB(const GameTimer& gt)
 
 
 	// T / G — частота волн.
-	if (GetAsyncKeyState('T') & 0x8000)
+	if (waveControls && (GetAsyncKeyState('T') & 0x8000))
 		mTessCB.WaveFrequency += 3.0f * gt.DeltaTime();
 
-	if (GetAsyncKeyState('G') & 0x8000)
+	if (waveControls && (GetAsyncKeyState('G') & 0x8000))
 		mTessCB.WaveFrequency -= 3.0f * gt.DeltaTime();
 
 	if (mTessCB.WaveFrequency < 0.1f)
@@ -2096,10 +2260,10 @@ void CrateApp::UpdateTessellationCB(const GameTimer& gt)
 
 
 	// R / F — скорость волн.
-	if (GetAsyncKeyState('R') & 0x8000)
+	if (waveControls && (GetAsyncKeyState('R') & 0x8000))
 		mTessCB.WaveSpeed += 3.0f * gt.DeltaTime();
 
-	if (GetAsyncKeyState('F') & 0x8000)
+	if (waveControls && (GetAsyncKeyState('F') & 0x8000))
 		mTessCB.WaveSpeed -= 3.0f * gt.DeltaTime();
 
 	if (mTessCB.WaveSpeed < 0.0f)
@@ -2109,15 +2273,7 @@ void CrateApp::UpdateTessellationCB(const GameTimer& gt)
 		mTessCB.WaveSpeed = 20.0f;
 
 
-	// F2 — переключить режим culling: linear / octree.
-	bool f2Down = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
-
-	if (f2Down && !mOctreeToggleKeyPressed)
-	{
-		mUseOctreeCulling = !mUseOctreeCulling;
-	}
-
-	mOctreeToggleKeyPressed = f2Down;
+	// Key 7 handles the octree toggle once in OnKeyboardInput.
 
 
 	memcpy(mTessCBMapped, &mTessCB, sizeof(TessellationConstants));
@@ -2142,6 +2298,7 @@ bool CrateApp::RaycastBreakfastRoom(XMFLOAT3& hitPos, XMFLOAT3& hitNormal)
 
 	for (const auto& sub : mObjMesh.SubMeshes)
 	{
+		if(mRoomCutaway && IsRoomCutawayShell(sub.ObjectName)) continue;
 		const auto& indices = sub.Indices;
 
 		for (size_t i = 0; i + 2 < indices.size(); i += 3)
@@ -2469,6 +2626,16 @@ void CrateApp::UpdateSinusoidalAnimations(const GameTimer& gt)
 	for (auto& item : mAllRitems)
 	{
 		RenderItem* ritem = item.get();
+        if(ritem->MotionDemoBox)
+        {
+            const float t=mDemoBoxTime;
+            const float offset=2.8f*sinf(t*1.2f);
+            XMStoreFloat4x4(&ritem->World,
+                XMMatrixScaling(2.5f,2.5f,2.5f)*XMMatrixRotationY(t*0.9f)*
+                XMMatrixTranslation(11.77f+0.841f*offset,8.55f,-18.3f+0.541f*offset));
+            ritem->NumFramesDirty=gNumFrameResources;
+            continue;
+        }
 		if (!ritem->EnableSinusoidalAnimation)
 			continue;
 
@@ -2502,6 +2669,9 @@ void CrateApp::UpdateObjectCBs(const GameTimer& gt)
 	for (auto& e : mAllRitems)
 	{
 		// Картина обновляется каждый кадр из-за анимации
+        // PreviousWorld must describe the last rendered frame, not this frame-resource's old data.
+        e->NumFramesDirty=gNumFrameResources;
+        if(!e->HasPreviousWorld) {e->PreviousWorld=e->World; e->HasPreviousWorld=true;}
 		if (e->AnimType == 1)
 			e->NumFramesDirty = gNumFrameResources;
 
@@ -2512,13 +2682,17 @@ void CrateApp::UpdateObjectCBs(const GameTimer& gt)
 
 			ObjectConstants objConstants;
 			XMStoreFloat4x4(&objConstants.World, XMMatrixTranspose(world));
+            XMStoreFloat4x4(&objConstants.PreviousWorld,XMMatrixTranspose(XMLoadFloat4x4(&e->PreviousWorld)));
+            objConstants.PreviousTime=mPreviousSceneTime;
 			XMStoreFloat4x4(&objConstants.TexTransform, XMMatrixTranspose(texTransform));
 			objConstants.AnimType = e->AnimType;
 
 			currObjectCB->CopyData(e->ObjCBIndex, objConstants);
 			e->NumFramesDirty--;
+            e->PreviousWorld=e->World;
 		}
 	}
+    mPreviousSceneTime=gt.TotalTime();
 }
 
 void CrateApp::UpdateMaterialCBs(const GameTimer& gt)
@@ -2566,8 +2740,8 @@ void CrateApp::UpdateMainPassCB(const GameTimer& gt)
 	mMainPassCB.EyePosW = mEyePos;
 	mMainPassCB.RenderTargetSize = XMFLOAT2((float)mClientWidth, (float)mClientHeight);
 	mMainPassCB.InvRenderTargetSize = XMFLOAT2(1.0f / mClientWidth, 1.0f / mClientHeight);
-	mMainPassCB.NearZ = mTerrainMode ? 0.5f : 1.0f;
-	mMainPassCB.FarZ = mTerrainMode ? 12000.0f : 1000.0f;
+	mMainPassCB.NearZ = 0.5f;
+	mMainPassCB.FarZ = 12000.0f;
 	mMainPassCB.TotalTime = gt.TotalTime();
 	mMainPassCB.DeltaTime = gt.DeltaTime();
 	mMainPassCB.AmbientLight = { 0.6f, 0.6f, 0.6f, 1.0f }; // было 0.25
@@ -3382,6 +3556,7 @@ void CrateApp::BuildRenderItems()
 
 			auto ritem = std::make_unique<RenderItem>();
 			// Если это картина — включаем анимацию качания
+            ritem->RoomCutawayShell=IsRoomCutawayShell(sub.ObjectName);
 			if (sub.MaterialName == "breakfast_room:Artwork")
 				ritem->AnimType = 1;
 			ritem->ObjCBIndex = (UINT)i;
@@ -3449,6 +3624,7 @@ void CrateApp::DrawShadowCasters(
 	{
 		if (ri == nullptr || ri->Geo == nullptr)
 			continue;
+        if(mRoomCutaway && ri->RoomCutawayShell) continue;
 
 		cmdList->IASetVertexBuffers(0, 1, &ri->Geo->VertexBufferView());
 		cmdList->IASetIndexBuffer(&ri->Geo->IndexBufferView());
@@ -3480,6 +3656,7 @@ void CrateApp::DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::ve
     for(size_t i = 0; i < ritems.size(); ++i)
     {
         auto ri = ritems[i];
+        if(mRoomCutaway && ri->RoomCutawayShell) continue;
 
         cmdList->IASetVertexBuffers(0, 1, &ri->Geo->VertexBufferView());
         cmdList->IASetIndexBuffer(&ri->Geo->IndexBufferView());
